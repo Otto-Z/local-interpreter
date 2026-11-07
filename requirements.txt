@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+numpy
+mlx-whisper
+onnxruntime
+httpx
+zhconv
+sherpa-onnx
+pypinyin
+mlx-audio
+mlx-lm
+pymupdf
+python-docx
+python-multipart

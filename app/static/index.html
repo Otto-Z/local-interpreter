@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>本地同传 · 离线实时翻译</title>
+<link rel="stylesheet" href="/static/style.css?v=2.2.3">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo"></span>
+      <span>本地同传</span>
+    </div>
+    <div class="tabs">
+      <button class="tab active" id="tabLive">实时</button>
+      <button class="tab" id="tabHistory">课程</button>
+    </div>
+    <div class="pills">
+      <span class="pill" id="asrPill" title="语音识别模型状态">
+        <i class="dot loading"></i><span id="asrText">语音模型加载中…</span>
+      </span>
+      <span class="pill" id="llmPill" title="翻译模型状态">
+        <i class="dot loading"></i><span id="llmText">翻译模型检测中…</span>
+      </span>
+    </div>
+    <div class="spacer"></div>
+    <button class="icon-btn" id="settingsBtn" title="设置">设置</button>
+    <button class="icon-btn" id="assistantBtn" title="课堂助教">助教</button>
+    <button class="icon-btn" id="overlayBtn" title="悬浮字幕（⌘⇧F）">浮字幕</button>
+    <button class="icon-btn" id="subtitleBtn" title="全屏字幕模式（⌘⇧S）">字幕模式</button>
+  </header>
+
+  <div class="workspace" id="livePage">
+  <main class="transcript" id="transcript">
+    <div class="empty" id="empty">
+      <h1>离线同声传译</h1>
+      <p>选择音频来源后点「开始」。语音识别与翻译全部在本机完成，不联网。</p>
+      <p class="hint">系统音频：点开始后在弹窗中选择「整个屏幕」并勾选「分享系统音频」。</p>
+    </div>
+  </main>
+
+  <aside class="assistant" id="assistant">
+    <div class="assistant-head">
+      <span>课堂助教</span>
+      <div class="assistant-actions">
+        <button class="icon-btn" id="recapBtn">最近总结</button>
+        <button class="icon-btn" id="assistantClose">收起</button>
+      </div>
+    </div>
+    <div class="assistant-body">
+      <p class="note" id="assistantHint"></p>
+      <section>
+        <h4>最近总结</h4>
+        <div class="summary-list" id="recapList"><p class="note">点右上「最近总结」生成最近几分钟的文字总结。</p></div>
+      </section>
+      <section>
+        <h4>本场要点</h4>
+        <div class="summary-list" id="summaryList"><p class="note">开始后自动生成…</p></div>
+      </section>
+      <section>
+        <h4>问题</h4>
+        <div class="question-list" id="questionList"><p class="note">识别到课堂提问时会在这里给出答案。</p></div>
+      </section>
+    </div>
+    <div class="assistant-ask">
+      <input id="askInput" placeholder="问点什么…（回车）">
+      <button class="mini" id="askBtn">提问</button>
+    </div>
+  </aside>
+  </div>
+
+  <section class="courses-page hidden" id="coursesPage">
+    <aside class="course-sidebar">
+      <div class="course-new">
+        <input id="newCourseName" placeholder="新课程名称">
+        <select id="newCourseKind" class="mini-select" title="课程类型">
+          <option value="课堂">课堂</option>
+          <option value="会议">会议</option>
+          <option value="访谈">访谈</option>
+          <option value="视频">视频</option>
+          <option value="其它">其它</option>
+        </select>
+        <button class="mini" id="createCourse">新建</button>
+      </div>
+      <div class="course-list" id="courseList"></div>
+    </aside>
+    <div class="course-main">
+      <div class="course-empty" id="courseEmpty">
+        <p>选择左侧课程，或新建一个课程。每堂课的录音、字幕、总结和资料都会归到这个课程下。</p>
+      </div>
+      <div class="course-detail hidden" id="courseDetail">
+        <div class="course-head">
+          <h2 id="courseTitle"></h2>
+          <button class="icon-btn" id="courseExport">导出课程</button>
+          <button class="icon-btn" id="courseRename">重命名</button>
+          <button class="icon-btn" id="courseDelete">删除</button>
+        </div>
+        <div class="detail-meta" id="courseMeta"></div>
+        <div class="detail-section">
+          <h3>问这门课</h3>
+          <div class="row">
+            <input id="courseAskInput" placeholder="跨课次提问，例如：前几节课讲了哪些模型？">
+            <button class="mini" id="courseAskBtn">提问</button>
+          </div>
+          <div class="course-answer hidden" id="courseAnswer"></div>
+        </div>
+        <div class="detail-section">
+          <h3>课前预习</h3>
+          <div class="detail-actions">
+            <button class="mini" id="outlineBtn">根据资料生成提纲</button>
+          </div>
+          <pre class="outline-box" id="courseOutline"></pre>
+        </div>
+        <div class="detail-section">
+          <h3>术语表</h3>
+          <div class="row glossary-row">
+            <input id="glossaryTerm" placeholder="术语">
+            <input id="glossaryTrans" placeholder="译名 / 说明">
+            <button class="mini" id="glossaryAdd">添加</button>
+            <button class="mini" id="glossaryGen">AI 自动提取</button>
+          </div>
+          <div class="glossary-list" id="glossaryList"></div>
+        </div>
+        <div class="detail-section">
+          <h3>课程笔记</h3>
+          <textarea class="course-notes" id="courseNotes" placeholder="课程目标、进度、待办…"></textarea>
+          <div class="detail-actions"><button class="mini" id="saveCourseNotes">保存笔记</button></div>
+        </div>
+        <div class="detail-section">
+          <h3>课程资料</h3>
+          <div class="row">
+            <input type="file" id="materialFile" accept=".pdf,.docx,.pptx,.txt,.md,.markdown">
+          </div>
+          <div class="material-list" id="materialList"></div>
+          <p class="note">支持 PDF / DOCX / PPTX / TXT / Markdown；扫描版 PDF 会自动在本机 OCR。助教答题会优先引用并标注页码。</p>
+        </div>
+        <div class="detail-section">
+          <h3>课次</h3>
+          <div class="row" style="margin-bottom:10px">
+            <input id="lessonSearch" placeholder="搜索课次标题 / 摘要…">
+          </div>
+          <div class="session-list" id="sessionList"></div>
+          <div class="search-hits hidden" id="lessonHits"></div>
+        </div>
+        <div class="session-detail hidden" id="sessionDetail"></div>
+      </div>
+    </div>
+  </section>
+
+  <footer class="controls">
+    <button class="primary" id="startBtn"><span id="startIcon">▶</span><span id="startLabel">开始</span></button>
+    <button class="icon-btn hidden" id="pauseBtn">暂停</button>
+
+    <label class="field">
+      <span>课程</span>
+      <select id="courseSelect"></select>
+    </label>
+
+    <label class="field">
+      <span>音频来源</span>
+      <select id="sourceSelect">
+        <option value="mic">麦克风</option>
+        <option value="system">系统音频</option>
+      </select>
+    </label>
+
+    <label class="field">
+      <span>识别</span>
+      <select id="sourceLangBar"></select>
+    </label>
+
+    <label class="field">
+      <span>翻译成</span>
+      <select id="targetSelect"></select>
+    </label>
+
+    <div class="spacer"></div>
+    <div class="meta">
+      <span class="latency" id="latency"></span>
+      <span class="hint" id="sessionHint"></span>
+    </div>
+    <button class="icon-btn" id="bookmarkBtn" title="标记当前句，课后回看">标记</button>
+    <button class="icon-btn" id="exportBtn" title="导出 SRT 字幕">导出字幕</button>
+    <button class="icon-btn" id="clearBtn" title="清空记录">清空</button>
+  </footer>
+</div>
+
+<div class="subtitle hidden" id="subtitle">
+  <div class="sub-inner" id="subInner"></div>
+  <div class="sub-tip">按 Esc 退出字幕模式</div>
+</div>
+
+<div class="drawer-mask hidden" id="drawerMask"></div>
+<aside class="drawer hidden" id="drawer">
+  <div class="drawer-head">
+    <h2>设置</h2>
+    <button class="icon-btn" id="drawerClose">关闭</button>
+  </div>
+
+  <div class="drawer-body">
+    <section>
+      <h3>翻译</h3>
+      <label class="stack">
+        <span>翻译方式</span>
+        <select id="llmBackend">
+          <option value="builtin">内置模型（Hy-MT2-1.8B-4bit，离线）</option>
+          <option value="api">本地服务 / API（oMLX、LM Studio 等）</option>
+        </select>
+      </label>
+      <div id="apiConfig">
+        <div class="chips" id="presetRow">
+          <button class="chip" data-base="http://127.0.0.1:8000/v1">oMLX</button>
+          <button class="chip" data-base="http://127.0.0.1:1234/v1">LM Studio</button>
+          <button class="chip" data-base="http://127.0.0.1:8080/v1">vLLM</button>
+          <button class="chip accent" id="detectBtn">自动检测</button>
+          <button class="chip" id="readOmlxKey">读取 oMLX Key</button>
+        </div>
+        <label class="stack">
+          <span>接口地址</span>
+          <input id="llmBaseUrl" placeholder="http://127.0.0.1:8000/v1">
+        </label>
+        <label class="stack">
+          <span>模型</span>
+          <div class="row">
+            <select id="llmModelSelect"><option value="">（未检测到模型）</option></select>
+            <button class="mini" id="refreshModels">刷新</button>
+          </div>
+        </label>
+        <label class="stack">
+          <span>或手动填写模型名</span>
+          <input id="llmModel" placeholder="例如 mlx-community/Hy-MT2-7B-4bit">
+        </label>
+        <label class="stack">
+          <span>API Key（本地服务通常留空）</span>
+          <input id="llmApiKey" placeholder="可选">
+        </label>
+      </div>
+      <label class="stack">
+        <span>字幕显示</span>
+        <select id="translateMode">
+          <option value="sentence">整句（质量优先）</option>
+          <option value="append">流式追加（实验，低延迟）</option>
+        </select>
+        <span class="note">流式追加会边说话边固定译文；句末用完整正式译文收尾（草稿有偏差时会校正一次），保证不残缺。</span>
+      </label>
+      <p class="note" id="builtinNote">内置模型随应用提供，无需启动其他服务；启动时自动加载，约 1GB 内存。</p>
+      <div class="row test-row">
+        <button class="mini" id="testBtn">测试</button>
+        <span class="note inline" id="llmNote"></span>
+      </div>
+      <div id="testResult" class="test-result hidden"></div>
+    </section>
+
+    <section>
+      <h3>配置档</h3>
+      <div id="profileList" class="profile-list"></div>
+      <button class="mini wide-mini" id="saveProfile">把当前设置保存为配置档</button>
+    </section>
+
+    <section>
+      <h3>语音识别</h3>
+      <label class="stack">
+        <span>识别引擎</span>
+        <select id="asrEngine">
+          <option value="qwen3">Qwen3-ASR（最新，推荐）</option>
+          <option value="sensevoice">SenseVoice（最快，自带标点）</option>
+          <option value="whisper">Whisper（最准，较慢）</option>
+        </select>
+        <span class="note">Qwen3/SenseVoice 首次切换会自动下载模型；Whisper 模型只在使用 Whisper 时生效。</span>
+      </label>
+      <label class="stack">
+        <span>Qwen3-ASR 模型</span>
+        <select id="asrQwenModel">
+          <option value="mlx-community/Qwen3-ASR-0.6B-8bit">0.6B（快，约 1GB）</option>
+          <option value="mlx-community/Qwen3-ASR-1.7B-8bit">1.7B（更准，约 2.5GB）</option>
+        </select>
+      </label>
+      <label class="stack">
+        <span>Whisper 模型</span>
+        <select id="asrModel">
+          <option value="mlx-community/whisper-large-v3-turbo">large-v3-turbo（推荐，快且准）</option>
+          <option value="mlx-community/whisper-large-v3-mlx">large-v3（更准，较慢）</option>
+          <option value="mlx-community/whisper-large-v3-turbo-q4">large-v3-turbo-q4（最快，略降精度）</option>
+          <option value="mlx-community/whisper-small-mlx">small（最省资源）</option>
+        </select>
+      </label>
+      <label class="stack">
+        <span>识别语言</span>
+        <select id="sourceLang"></select>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="partials">
+        <span>说话过程中显示实时识别预览</span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="partialTranslate">
+        <span>说话过程中同步翻译草稿（更快看到译文）</span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="contextFix">
+        <span>根据上下文二次校正识别文本（保留原文，点击可切换）</span>
+      </label>
+    </section>
+
+    <section>
+      <h3>字幕显示</h3>
+      <label class="stack">
+        <span>字幕字号：<b id="subSizeVal"></b></span>
+        <input type="range" id="subtitleSize" min="24" max="80" step="2">
+      </label>
+      <label class="stack">
+        <span>背景不透明度：<b id="subOpacityVal"></b></span>
+        <input type="range" id="subtitleOpacity" min="20" max="95" step="5">
+      </label>
+    </section>
+
+    <section>
+      <h3>课堂助教</h3>
+      <label class="check">
+        <input type="checkbox" id="assistantEnabled">
+        <span>启用右侧助教栏</span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="assistantSummary">
+        <span>实时要点总结</span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="assistantQA">
+        <span>自动识别课堂提问并作答</span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="diarization">
+        <span>区分说话人（老师 / 同学）</span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="glossaryAuto">
+        <span>下课后自动补充课程术语表</span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="onlyTeacher">
+        <span>只回答主讲人（说话最多的人）的问题（需开启区分说话人）</span>
+      </label>
+      <label class="stack">
+        <span>只回答指定说话人（留空不限，例如「说话人 1」）</span>
+        <input id="targetSpeaker" placeholder="说话人 1">
+        <span class="note">需开启「区分说话人」；按说话人标签匹配。</span>
+      </label>
+      <label class="stack">
+        <span>分析服务地址（可选，留空用翻译模型）</span>
+        <input id="assistantBaseUrl" placeholder="例如 http://127.0.0.1:11434/v1">
+      </label>
+      <label class="stack">
+        <span>分析模型</span>
+        <input id="assistantModel" placeholder="例如 qwen2.5:7b-instruct">
+      </label>
+      <label class="stack">
+        <span>分析 API Key</span>
+        <input id="assistantApiKey" placeholder="可选">
+      </label>
+      <p class="note">留空使用内置 Qwen3-4B 助教模型（与翻译模型独立）；也可以填 oMLX 等外部服务。分析请求只在翻译空闲时执行。</p>
+    </section>
+
+
+
+    <section>
+      <h3>分句</h3>
+      <label class="stack">
+        <span>停顿多久算一句结束：<b id="endSilenceVal"></b></span>
+        <input type="range" id="endSilence" min="300" max="1200" step="50">
+      </label>
+      <label class="stack">
+        <span>连续说话时最长片段：<b id="maxSegVal"></b></span>
+        <input type="range" id="maxSeg" min="3" max="15" step="0.5">
+      </label>
+      <p class="note">停顿判定越短越跟手，但句子会被切得更碎。</p>
+    </section>
+
+    <section>
+      <h3>存储与隐私</h3>
+      <label class="stack">
+        <span>自动清理多少天前的课次（0 = 永久保留）</span>
+        <input type="number" id="retentionDays" min="0" max="3650" step="1">
+      </label>
+      <div id="storageStats" class="note">读取中…</div>
+      <div class="row">
+        <button class="mini" id="storageRefresh">刷新用量</button>
+        <button class="mini" id="storageCleanup">按设置清理</button>
+      </div>
+      <p class="note">录音、字幕、资料和模型都保存在本机，不上传云端。</p>
+    </section>
+
+    <section>
+      <h3>模型管理</h3>
+      <div id="modelStatus" class="note">读取中…</div>
+      <div class="row">
+        <button class="mini" id="modelRefresh">刷新状态</button>
+        <button class="mini" id="assistantDownload">下载助教模型</button>
+      </div>
+      <p class="note">轻量安装包不带助教模型；需要总结和答题时再下载（约 2.3GB），下载后完全离线。</p>
+    </section>
+
+    <section>
+      <h3>翻译评测</h3>
+      <p class="note">用固定例句测当前翻译链路的速度和完整性。正在上课时会拒绝运行，避免抢占模型。</p>
+      <button class="mini" id="evalBtn">运行评测</button>
+      <div id="evalResult" class="eval-result"></div>
+    </section>
+
+    <section>
+      <label class="check">
+        <input type="checkbox" id="showSource">
+        <span>在字幕中显示原文</span>
+      </label>
+    </section>
+  </div>
+
+  <div class="drawer-foot">
+    <button class="primary wide" id="saveSettings">保存</button>
+    <button class="ghost wide" id="quitApp">退出应用</button>
+    <p class="note" style="text-align:center;margin-top:10px">本地同传 v2.2.3</p>
+  </div>
+</aside>
+
+<div class="toast-wrap" id="toasts"></div>
+
+<script src="/static/app.js?v=2.2.3"></script>
+</body>
+</html>

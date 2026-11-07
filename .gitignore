@@ -1,0 +1,45 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+build/
+*.egg-info/
+
+# 运行数据（录音、数据库、课程资料、设置）
+data/settings.json
+data/*.db
+data/*.db-*
+data/recordings/
+data/materials/
+data/logs/
+data/test/server.log
+
+# 本地配置
+android/local.properties
+*.log
+
+# 打包产物
+dist/
+
+# Android 构建产物与本地缓存
+android/.gradle/
+android/app/build/
+android/app/.cxx/
+android/app/.kotlin/
+android/build/
+android/app/release/
+
+# 随原生构建生成、可从文档重建的资源
+android/vendor/llama.cpp/build*/
+android/vendor/sherpa-android.tar.bz2
+
+# 大模型文件（首次运行/构建时自动下载，见 README）
+data/models/
+app/models/
+android/app/src/main/assets/*.onnx

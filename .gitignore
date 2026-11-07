@@ -20,7 +20,7 @@ data/materials/
 data/logs/
 data/test/server.log
 
-# 本地配置
+# 本地配置（按机器生成，见 README「构建」）
 android/local.properties
 *.log
 
@@ -35,11 +35,12 @@ android/app/.kotlin/
 android/build/
 android/app/release/
 
-# 随原生构建生成、可从文档重建的资源
-android/vendor/llama.cpp/build*/
-android/vendor/sherpa-android.tar.bz2
+# llama.cpp 本地构建目录（源码保留在版本库中）
+android/vendor/llama.cpp/build-q2test/
 
-# 大模型文件（首次运行/构建时自动下载，见 README）
+# 运行时缓存的模型（首次运行时自动下载）
+# 注意：app/models 与 android 的 assets 模型是构建/运行必需，已入库
 data/models/
-app/models/
-android/app/src/main/assets/*.onnx
+
+# sherpa 预编译库的原始压缩包；解压后的 android/vendor/sherpa/jniLibs 已入库
+android/vendor/sherpa-android.tar.bz2

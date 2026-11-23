@@ -33,7 +33,6 @@
             android:exported="true"
             android:launchMode="singleTop"
             android:resizeableActivity="true"
-            android:screenOrientation="sensor"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -51,7 +50,6 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
             android:excludeFromRecents="true"
             android:exported="false"
-            android:screenOrientation="sensor"
             android:theme="@style/Theme.LocalInterpreter.Subtitle" />
 
         <service

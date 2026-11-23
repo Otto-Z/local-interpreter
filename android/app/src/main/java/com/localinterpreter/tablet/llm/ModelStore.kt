@@ -194,22 +194,22 @@ class ModelStore(private val context: Context) {
                         "存储空间不足：剩余 ${free / 1_048_576}MB，还需约 ${(remaining + 150L * 1024 * 1024) / 1_048_576}MB"
                     )
                 }
-                setState(kind, DownloadProgress("downloading", 0, kind.approxBytes, "连接中…"))
+                setState(kind, DownloadProgress("downloading", partialBytes, kind.approxBytes, "连接中…"))
                 when (kind) {
                     ModelKind.SENSEVOICE -> {
-                        val total = 239_000_000L
+                        val approx = 239_000_000L
                         downloadFile(
                             kind,
                             "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
-                            "model.int8.onnx", File(senseDir, "model.int8.onnx.part"), mirror, total
-                        ) { done ->
+                            "model.int8.onnx", File(senseDir, "model.int8.onnx.part"), mirror, approx
+                        ) { done, total ->
                             setState(kind, DownloadProgress("downloading", done, total, "正在下载识别模型"))
                         }
                         downloadFile(
                             kind,
                             "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
                             "tokens.txt", File(senseDir, "tokens.txt.part"), mirror, 0
-                        ) { }
+                        ) { _, _ -> }
                         val modelPart = File(senseDir, "model.int8.onnx.part")
                         if (modelPart.length() < MIN_SENSEVOICE) {
                             throw RuntimeException("识别模型下载不完整，已保留断点，请重新下载")
@@ -236,8 +236,8 @@ class ModelStore(private val context: Context) {
                             ModelKind.ASSISTANT_LITE -> "qwen2.5-1.5b-instruct-q4_k_m.gguf"
                             ModelKind.SENSEVOICE -> ""
                         }
-                        downloadFile(kind, repo, remote, part, mirror, kind.approxBytes) { done ->
-                            setState(kind, DownloadProgress("downloading", done, kind.approxBytes, "正在下载 ${kind.title}"))
+                        downloadFile(kind, repo, remote, part, mirror, kind.approxBytes) { done, total ->
+                            setState(kind, DownloadProgress("downloading", done, total, "正在下载 ${kind.title}"))
                         }
                         if (part.length() < minBytes(kind) || !hasGgufMagic(part)) {
                             throw RuntimeException("模型文件不完整或格式不正确，已保留断点，请重新下载")
@@ -245,6 +245,7 @@ class ModelStore(private val context: Context) {
                         if (!part.renameTo(file)) throw RuntimeException("保存模型文件失败，请检查存储空间")
                     }
                 }
+                readyCache.remove(kind.id)
                 setState(kind, DownloadProgress("done", fileFor(kind).length(), fileFor(kind).length(), "已就绪"))
                 AppLog.d("Model", "下载完成 ${kind.id} size=${fileFor(kind).length() / 1_048_576}MB")
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -300,15 +301,17 @@ class ModelStore(private val context: Context) {
         _progress.update { it + (kind.id to p) }
     }
 
-    /** 只取响应头里的 ETag；失败返回空串，调用方按「无法校验」处理（仍可续传）。 */
-    private fun headEtag(url: String): String? {
+    /** 只取响应头里的 ETag（回退 Last-Modified）；失败返回 null，调用方按「无法校验」处理（仍可续传）。 */
+    private fun headVersionStamp(url: String): String? {
         val request = Request.Builder()
             .url(url)
             .head()
             .header("User-Agent", "LocalInterpreterTablet/1.0")
             .build()
         return client.newCall(request).execute().use { resp ->
-            if (!resp.isSuccessful) null else resp.header("ETag")
+            if (!resp.isSuccessful) null
+            else resp.header("ETag")?.takeIf { it.isNotBlank() }
+                ?: resp.header("Last-Modified")?.takeIf { it.isNotBlank() }
         }
     }
 
@@ -319,7 +322,7 @@ class ModelStore(private val context: Context) {
         dest: File,
         mirror: Boolean,
         expectedTotal: Long,
-        onProgress: (Long) -> Unit,
+        onProgress: (Long, Long) -> Unit,
     ) {
         val hosts = if (mirror) listOf("https://hf-mirror.com", "https://huggingface.co")
         else listOf("https://huggingface.co")
@@ -338,7 +341,7 @@ class ModelStore(private val context: Context) {
                 // 续传前校验远端版本：上游换了文件还接着旧断点拼，会得到「能下完但加载失败」的模型。
                 val savedEtag = if (existing > 0) runCatching { stamp.readText() }.getOrNull().orEmpty() else ""
                 if (existing > 0 && savedEtag.isNotBlank()) {
-                    val remoteEtag = runCatching { headEtag(url) }.getOrNull().orEmpty()
+                    val remoteEtag = runCatching { headVersionStamp(url) }.getOrNull().orEmpty()
                     if (remoteEtag.isNotBlank() && remoteEtag != savedEtag) {
                         AppLog.d("Model", "远端模型已更新，丢弃旧断点 ${tmp.length() / 1_048_576}MB $name")
                         tmp.delete()
@@ -359,9 +362,15 @@ class ModelStore(private val context: Context) {
                             ?.groupValues?.getOrNull(1)?.toLongOrNull()
                         val complete = remoteTotal != null && existing == remoteTotal
                         if (complete) {
+                            if (name.endsWith(".gguf", ignoreCase = true) && !hasGgufMagic(tmp)) {
+                                tmp.delete()
+                                stamp.delete()
+                                throw RuntimeException("断点文件不是有效的 GGUF，已清理请重试")
+                            }
                             if (!tmp.renameTo(dest)) {
                                 throw RuntimeException("保存下载文件失败，请检查存储空间")
                             }
+                            stamp.delete()
                             calls.remove(kind.id)
                             return
                         }
@@ -384,17 +393,26 @@ class ModelStore(private val context: Context) {
                         }
                         existing = 0L
                     }
-                    val etag = resp.header("ETag").orEmpty()
+                    val etag = resp.header("ETag")?.takeIf { it.isNotBlank() }
+                        ?: resp.header("Last-Modified").orEmpty()
                     if (etag.isNotBlank()) runCatching { stamp.writeText(etag) }
                     val append = existing > 0 && resp.code == 206
                     val contentRange = resp.header("Content-Range")
                     if (append && contentRange != null && !contentRange.startsWith("bytes $existing-")) {
-                        throw RuntimeException("服务器续传位置不正确，已重新下载")
+                        // 续传偏移不符：清理损坏的断点文件并从头重下，而不是保留坏断点反复失败。
+                        tmp.delete()
+                        stamp.delete()
+                        if (!restarted) {
+                            restarted = true
+                            hostIndex--
+                        }
+                        throw RuntimeException("服务器续传位置不正确，已清理断点重试")
                     }
                     val contentLength = resp.body?.contentLength() ?: -1
                     val total = if (contentLength > 0) {
                         contentLength + (if (append) existing else 0)
                     } else expectedTotal
+                    if (total > 0) onProgress(if (append) existing else 0L, total)
                     resp.body?.byteStream()?.use { input ->
                         (if (append) tmp.appendStream() else tmp.outputStream()).use { out ->
                             val buf = ByteArray(1 shl 16)
@@ -408,13 +426,13 @@ class ModelStore(private val context: Context) {
                                 done += n
                                 if (done - lastReport > 512 * 1024) {
                                     lastReport = done
-                                    onProgress(if (expectedTotal > 0) done.coerceAtMost(expectedTotal) else done)
+                                    onProgress(done, if (total > 0) maxOf(total, done) else expectedTotal)
                                 }
                             }
                             if (contentLength > 0 && done < total) {
                                 throw RuntimeException("下载不完整（${done}/${total}），已保留断点，请重新下载")
                             }
-                            onProgress(total)
+                            onProgress(done, if (total > 0) maxOf(total, done) else done)
                         }
                     }
                     // 镜像有时会用 200 返回错误网页；先验证 GGUF 头，别把 HTML 当成模型保存。

@@ -58,6 +58,9 @@ data class LiveSegment(
     val lowConfidence: Boolean = false,
     val audioPath: String? = null,
     val corrected: Boolean = false,
+    val speakerId: Long? = null,
+    val draftTgt: Boolean = false,
+    val bookmarked: Boolean = false,
 )
 
 data class LiveQuestion(
@@ -93,6 +96,7 @@ data class LiveState(
     val audioLevel: Float = 0f,
     val speaking: Boolean = false,
     val assistantBusy: Boolean = false,
+    val pendingQueue: Int = 0,
 )
 
 class LiveController(private val app: App) {
@@ -100,6 +104,49 @@ class LiveController(private val app: App) {
     private val _state = MutableStateFlow(LiveState())
     val state: StateFlow<LiveState> = _state.asStateFlow()
     val asrStatus: StateFlow<String> get() = asr.status
+
+    private data class NoiseProfile(
+        val vadThreshold: Float,
+        val vadMinSpeech: Float,
+        val speechFloor: Float,
+        val speechMult: Float,
+        val segFloor: Float,
+        val segMult: Float,
+        val partialFloor: Float,
+        val partialMult: Float,
+        val hallucinationEnergy: Float,
+    )
+
+    private fun noiseProfile(): NoiseProfile = when (app.settings.value.noiseSuppression) {
+        SettingsData.NOISE_SENSITIVE -> NoiseProfile(
+            vadThreshold = 0.36f, vadMinSpeech = 0.22f,
+            speechFloor = 0.0026f, speechMult = 1.6f,
+            segFloor = 0.0024f, segMult = 1.4f,
+            partialFloor = 0.0028f, partialMult = 1.6f,
+            hallucinationEnergy = 0.010f,
+        )
+        SettingsData.NOISE_STRICT -> NoiseProfile(
+            vadThreshold = 0.56f, vadMinSpeech = 0.34f,
+            speechFloor = 0.0075f, speechMult = 2.6f,
+            segFloor = 0.0068f, segMult = 2.2f,
+            partialFloor = 0.0080f, partialMult = 2.5f,
+            hallucinationEnergy = 0.022f,
+        )
+        else -> NoiseProfile(
+            vadThreshold = 0.45f, vadMinSpeech = 0.28f,
+            speechFloor = 0.0042f, speechMult = 2.0f,
+            segFloor = 0.0038f, segMult = 1.6f,
+            partialFloor = 0.0045f, partialMult = 1.9f,
+            hallucinationEnergy = 0.015f,
+        )
+    }
+
+    private fun refreshPendingQueue() {
+        val total = (finalPending.get() + translatePending.get()).coerceAtLeast(0)
+        if (_state.value.pendingQueue != total) {
+            _state.update { if (it.pendingQueue == total) it else it.copy(pendingQueue = total) }
+        }
+    }
 
     private val asr = AsrEngine()
     private val speakerEngine = SpeakerEngine()
@@ -113,10 +160,12 @@ class LiveController(private val app: App) {
     private val finalChannel = Channel<PendingFinal>(Channel.UNLIMITED)
     private val translateChannel = Channel<TranslateJob>(Channel.UNLIMITED)
     private val questionChannel = Channel<QuestionJob>(Channel.UNLIMITED)
+    private val diarizeChannel = Channel<DiarizeJob>(Channel.UNLIMITED)
     private val draftChannel = Channel<DraftJob>(Channel.CONFLATED)
     private var workersStarted = false
     private val finalPending = AtomicInteger(0)
     private val translatePending = AtomicInteger(0)
+    private val nextTempId = java.util.concurrent.atomic.AtomicLong(-1L)
     private val analysisMutex = Mutex()
     private val speakerMutex = Mutex()
     /** 串行化「开始 / 恢复」的状态占位，避免恢复课次和用户点开始时互相覆盖。 */
@@ -152,6 +201,7 @@ class LiveController(private val app: App) {
     @Volatile private var targetLangPref = "auto"
 
     private data class LiveSpeaker(val id: Long, val label: String, val color: String, val embedding: FloatArray)
+    private data class DiarizeJob(val sessionId: Long, val segmentId: Long, val samples: FloatArray)
     private data class PendingFinal(
         val sessionId: Long,
         val samples: FloatArray,
@@ -225,7 +275,8 @@ class LiveController(private val app: App) {
             "Live",
             "开始同传 source=$source course=${sessionCourse ?: "-"} src=${settings.sourceLang} tgt=${settings.targetLang} " +
                 "mode=${settings.llmMode}/${settings.modelVariant} asrThreads=${settings.asrThreads} llmThreads=${settings.llmThreads} " +
-                "pause=${settings.pauseMs} draft=${settings.draftTranslate} diar=${settings.diarization} " +
+                "pause=${settings.pauseMs} noise=${settings.noiseSuppression} ctx=${settings.translationContext} " +
+                "draft=${settings.draftTranslate} diar=${settings.diarization} " +
                 "sense=${app.models.senseVoiceModel().length() / 1_048_576}MB",
         )
         speakers.clear()
@@ -263,7 +314,12 @@ class LiveController(private val app: App) {
                 sessionId = withContext(Dispatchers.IO) {
                     app.db.createSession(sessionCourse, source.id, sourceLangPref, targetLangPref)
                 }
-                val segmenter = VadSegmenter(settings.pauseMs)
+                val np = noiseProfile()
+                val segmenter = if (source == LiveSource.MIC) {
+                    VadSegmenter(settings.pauseMs, threshold = np.vadThreshold, minSpeech = np.vadMinSpeech)
+                } else {
+                    VadSegmenter(settings.pauseMs, threshold = 0.38f, minSpeech = 0.24f)
+                }
                 localSegmenter = segmenter
                 vad = segmenter
                 val channel = Channel<FloatArray>(
@@ -397,7 +453,7 @@ class LiveController(private val app: App) {
                     }
                     throw kotlinx.coroutines.CancellationException("start cancelled")
                 }
-                app.llm.warmUpTranslator()
+                app.llm.warmUpTranslator(glossaryText)
                 sessionJob = scope.launch {
                     try {
                         processAudio(
@@ -481,6 +537,15 @@ class LiveController(private val app: App) {
             }
         }
 
+        /** 无人说话时仅保留极短的前导滚动缓冲，防止环境杂音长期累积被误送去识别。 */
+        fun trimToTail(keep: Int) {
+            if (size > keep) {
+                val drop = size - keep
+                System.arraycopy(data, drop, data, 0, keep)
+                size = keep
+            }
+        }
+
         fun toFloatArray(): FloatArray = data.copyOf(size)
         fun clear() { size = 0 }
         fun subListFrom(from: Int): FloatArray = data.copyOfRange(from, size)
@@ -502,59 +567,94 @@ class LiveController(private val app: App) {
         var filled = 0
         var windowCount = 0L
         val current = FloatBuf(16000 * 14)
+        val preRollSamples = 16000 / 2 // 0.5 秒前导缓冲，保证开口首字不丢失
         var wasPaused = false
         var lastSafetyAt = 0L
         var pausedAtWall = 0L
         var pausedTotalMs = 0L
         var quietWindows = 0L
+        // 自适应底噪基线（EMA）：若用户做过 2 秒环境测噪校准，直接以实测值作为初始基线，第 0 秒即精准抑噪。
+        val calibrated = app.settings.value.calibratedNoiseFloor
+        var noiseFloor = if (!fileMode && calibrated in 0.0005f..0.03f) calibrated else 0.002f
+        var speechWindowsInBuf = 0
+        var nonSpeechRun = 0
+        var lastPartialSampleSize = 0
+        // 跨 drainSegments 保留 <0.4s 的短片段，等待下一句合并；静音超过 2s 或暂停/结束时自动刷出。
+        var carry: FloatArray? = null
+        var carryStart = 0L
+        var carrySinceMs = 0L
         bufferEpoch++
 
         fun timeOffset(): Double = if (wallClockSource) pausedTotalMs / 1000.0 else 0.0
 
         fun clearCurrent() {
             current.clear()
+            speechWindowsInBuf = 0
+            nonSpeechRun = 0
+            lastPartialSampleSize = 0
             bufferEpoch++
         }
 
-        suspend fun drainSegments(): Int {
+        suspend fun drainSegments(flushCarry: Boolean = false): Int {
             val batch = mutableListOf<VadChunk>()
-            var carry: FloatArray? = null
-            var carryStart = 0L
+            val np = noiseProfile()
+            val minSegRms = if (fileMode) 0.0012f else max(np.segFloor, noiseFloor * np.segMult)
             while (true) {
                 val seg = segmenter.nextSegment() ?: break
+                // 实时模式下二次声学校验：过滤 VAD 误切出的微弱底噪/敲击/气息声。
+                if (!fileMode) {
+                    val segRms = rms(seg.samples)
+                    val segPeak = peak(seg.samples)
+                    if (segRms < minSegRms && segPeak < 0.02f) {
+                        continue
+                    }
+                }
                 val merged = if (carry != null) {
-                    // 把 <3 字的碎片并到下一句，避免一次完整模型调用只换两三个字。
+                    // 把 <0.4s 的碎片并到下一句，避免一次完整模型调用只换两三个字。
                     val audio = FloatArray(carry!!.size + seg.samples.size)
                     carry!!.copyInto(audio)
                     seg.samples.copyInto(audio, carry!!.size)
                     VadChunk(carryStart, audio)
                 } else seg
-                if (merged.samples.size < MIN_SEGMENT_SAMPLES) {
+                if (merged.samples.size < MIN_SEGMENT_SAMPLES && !flushCarry) {
                     carry = merged.samples
                     carryStart = merged.startSamples
+                    carrySinceMs = SystemClock.elapsedRealtime()
                     continue
                 }
                 batch += merged
                 carry = null
+                carrySinceMs = 0L
             }
-            // 尾巴上的碎片没有下一句可并：够短就直接丢弃（<0.4s 基本是噪声），
-            // 避免流结束时单独跑一次模型。
-            if (carry != null && carry!!.size >= MIN_SEGMENT_SAMPLES / 2) {
-                batch += VadChunk(carryStart, carry!!)
+            val nowMs = SystemClock.elapsedRealtime()
+            val carryExpired = carry != null && carrySinceMs > 0L && (nowMs - carrySinceMs >= 2000L)
+            if (carry != null && (flushCarry || carryExpired)) {
+                // 尾巴上/停顿 2 秒后的碎片：够长（>=0.28s）且能量达标才单独识别，太短多为杂音直接丢弃。
+                val c = carry!!
+                val carryOk = c.size >= MIN_CARRY_FLUSH_SAMPLES &&
+                    (fileMode || rms(c) >= minSegRms || peak(c) >= 0.025f)
+                if (carryOk) {
+                    batch += VadChunk(carryStart, c)
+                }
+                carry = null
+                carrySinceMs = 0L
             }
             if (batch.isEmpty()) return 0
-            // 预览文本只对应最近 10 秒；一次 flush 出多句时归给最后一句，避免塞进第一句。
+            // 预览文本只对应最近几秒；一次 flush 出多句时归给最后一句，避免塞进第一句。
             val preview = lastPartialText
             lastPartialText = ""
             val offset = timeOffset()
+            val curSourceLang = sourceLangPref
+            val curTargetLang = targetLangPref
+            val curGlossary = glossaryText
             batch.forEachIndexed { index, seg ->
                 val t0 = seg.startSamples / 16000.0 + offset
                 val t1 = t0 + seg.samples.size / 16000.0
                 val fallback = if (index == batch.lastIndex) preview else ""
                 // VAD 切句时先把预览提升成正式字幕行，最终 ASR 完成后再原地替换，
-                // 这样慢设备上不必等 2-5 秒的最终识别才看到文字。
+                // 这样慢设备上不必等最终识别才看到文字。
                 val provisionalId = if (fallback.isNotBlank()) {
-                    val pid = -(System.nanoTime() and 0x7fffffffL).coerceAtLeast(1)
+                    val pid = nextTempId.decrementAndGet()
                     _state.update { st ->
                         if (st.sessionId != sessionId) st
                         else {
@@ -562,7 +662,10 @@ class LiveController(private val app: App) {
                             // 把已经算好的草稿译文一起带进正式行，先给用户一个译稿，最终译文到达后替换。
                             val draftTgt = if (samePartial) st.partialTgt else ""
                             st.copy(
-                                segments = st.segments + LiveSegment(pid, t0, t1, "", fallback, draftTgt),
+                                segments = st.segments + LiveSegment(
+                                    id = pid, t0 = t0, t1 = t1, srcLang = "", src = fallback,
+                                    tgt = draftTgt, draftTgt = draftTgt.isNotBlank(),
+                                ),
                                 partialSrc = if (samePartial) "" else st.partialSrc,
                                 partialTgt = if (samePartial) "" else st.partialTgt,
                                 partialDraft = if (samePartial) false else st.partialDraft,
@@ -572,18 +675,20 @@ class LiveController(private val app: App) {
                     pid
                 } else null
                 finalPending.incrementAndGet()
+                refreshPendingQueue()
                 AppLog.d("Live", "VAD 分句 start=${"%.2f".format(t0)}s len=${seg.samples.size / 16000.0}s fallback=${fallback.length}字")
                 try {
                     finalChannel.send(
                         PendingFinal(
                             sessionId, seg.samples, t0, t1, SystemClock.elapsedRealtime(),
-                            fallback, sessionSourceLang, sessionTargetLang, sessionGlossary, sessionCourse,
+                            fallback, curSourceLang, curTargetLang, curGlossary, sessionCourse,
                             provisionalId,
                             if (latProbe) System.currentTimeMillis() else 0L,
                         )
                     )
                 } catch (t: Throwable) {
                     finalPending.decrementAndGet()
+                    refreshPendingQueue()
                     if (provisionalId != null) {
                         _state.update { st ->
                             st.copy(segments = st.segments.filterNot { it.id == provisionalId })
@@ -597,19 +702,22 @@ class LiveController(private val app: App) {
 
         /**
          * VAD 在嘈杂/远场音频上可能一直不触发分句，导致文字只停留在预览行里被下一段顶掉。
-         * 这里把当前缓冲强制送入最终识别，保证说过的内容一定会入库。
+         * 这里把当前缓冲强制送入最终识别，但严格校验缓冲内确实存在足够人声活动与信噪比，
+         * 彻底杜绝无人说话时底噪每 6 秒触发一次兜底识别与幻觉字幕。
          */
         fun commitCurrent(reason: String): Boolean {
+            if (!fileMode && speechWindowsInBuf < MIN_SPEECH_WINDOWS) return false
             val preview = lastPartialText
             val available = current.toFloatArray()
             val maxLen = 16000 * 14
             val samples = if (available.size > maxLen) {
                 available.copyOfRange(available.size - maxLen, available.size)
             } else available
-            // 没有足够音频或环境基本是静音时不要提交，避免把识别幻觉写成字幕。
             if (samples.size < 8000) return false
             val energy = rms(samples)
-            if (energy < 0.0015f) return false
+            val np = noiseProfile()
+            val minCommitEnergy = if (fileMode) 0.0015f else max(np.partialFloor, noiseFloor * np.partialMult)
+            if (energy < minCommitEnergy) return false
             // 噪声环境下识别会反复产生同一句幻觉，和最近字幕相同就丢弃，避免刷屏。
             val key = preview.filter { it.isLetterOrDigit() }
             if (key.length >= 2 &&
@@ -617,7 +725,6 @@ class LiveController(private val app: App) {
                     seg.src.filter { it.isLetterOrDigit() } == key
                 }
             ) {
-                // 不要立刻丢掉整段缓冲：里面可能还有重复句之后的新内容。
                 if (current.size >= 16000 * 12) {
                     clearCurrent()
                     lastPartialText = ""
@@ -628,26 +735,28 @@ class LiveController(private val app: App) {
             val t0 = (t1 - samples.size / 16000.0).coerceAtLeast(0.0)
             lastPartialText = ""
             finalPending.incrementAndGet()
+            refreshPendingQueue()
             AppLog.d(
                 "Live",
-                "$reason start=${"%.2f".format(t0)}s len=${samples.size / 16000.0}s energy=${"%.3f".format(energy)} preview=${preview.length}字"
+                "$reason start=${"%.2f".format(t0)}s len=${samples.size / 16000.0}s energy=${"%.4f".format(energy)} " +
+                    "floor=${"%.4f".format(noiseFloor)} speechWin=$speechWindowsInBuf preview=${preview.length}字"
             )
             try {
                 finalChannel.trySend(
                     PendingFinal(
                         sessionId, samples, t0, t1, SystemClock.elapsedRealtime(),
-                        preview, sessionSourceLang, sessionTargetLang, sessionGlossary, sessionCourse,
+                        preview, sourceLangPref, targetLangPref, glossaryText, sessionCourse,
                         null,
                         if (latProbe) System.currentTimeMillis() else 0L,
                     )
                 ).getOrThrow()
             } catch (t: Throwable) {
                 finalPending.decrementAndGet()
+                refreshPendingQueue()
                 AppLog.e("Live", "兜底提交失败", t)
                 return false
             }
-            current.clear()
-            bufferEpoch++
+            clearCurrent()
             draftGeneration++
             return true
         }
@@ -655,11 +764,19 @@ class LiveController(private val app: App) {
         try {
             for (frames in channel) {
                 if (_state.value.sessionId != sessionId) continue
+                // 音频重新进来后，自动清掉之前的「没有收到音频数据」告警条。
+                if (_state.value.error?.startsWith("没有收到音频数据") == true) {
+                    _state.update {
+                        if (it.sessionId == sessionId && it.error?.startsWith("没有收到音频数据") == true) {
+                            it.copy(error = null)
+                        } else it
+                    }
+                }
                 if (_state.value.paused) {
                     if (!wasPaused) {
                         wasPaused = true
                         // 不要在会话中途 flush VAD：部分 sherpa 版本 flush 后不再分句。
-                        val emitted = drainSegments()
+                        val emitted = drainSegments(flushCarry = true)
                         if (emitted == 0) commitCurrent("暂停兜底")
                         clearCurrent()
                         pausedAtWall = SystemClock.elapsedRealtime()
@@ -681,34 +798,86 @@ class LiveController(private val app: App) {
                     offset += n
                     if (filled == window) {
                         segmenter.accept(chunk.copyOf())
-                        current.append(chunk, window)
                         filled = 0
                         windowCount++
+                        val level = rms(chunk)
+                        val isSpeechNow = segmenter.isSpeech()
+
+                        // 动态估计环境底噪基线：只在非说话帧更新，快速适应安静、慢速跟踪稳态风扇/空调底噪。
+                        if (!fileMode && !isSpeechNow && level > 0.0002f) {
+                            noiseFloor = when {
+                                level < noiseFloor -> noiseFloor * 0.88f + level * 0.12f
+                                level < noiseFloor * 3.0f -> noiseFloor * 0.97f + level * 0.03f
+                                else -> noiseFloor
+                            }.coerceIn(0.0012f, 0.03f)
+                        }
+                        val np = noiseProfile()
+                        val speechEnergyGate = if (fileMode) 0.0012f else max(np.speechFloor, noiseFloor * np.speechMult)
+
+                        if (isSpeechNow) {
+                            nonSpeechRun = 0
+                        } else {
+                            nonSpeechRun++
+                        }
+
+                        if (fileMode) {
+                            current.append(chunk, window)
+                            if (isSpeechNow) speechWindowsInBuf++
+                        } else if (isSpeechNow) {
+                            current.append(chunk, window)
+                            if (level >= speechEnergyGate) speechWindowsInBuf++
+                        } else if (speechWindowsInBuf > 0) {
+                            // 刚说完话处于停顿等待 VAD 切句阶段：继续保留尾音直到切句或超时。
+                            current.append(chunk, window)
+                            // 连续静音超过 ~2.1 秒仍未切出正式句且未形成有效预览，说明只是短暂杂音（如咳嗽/敲桌），直接回退到静音前导状态。
+                            if (nonSpeechRun >= 65 && (speechWindowsInBuf < MIN_SPEECH_WINDOWS || lastPartialText.isBlank())) {
+                                clearCurrent()
+                                lastPartialText = ""
+                                _state.update {
+                                    if (it.sessionId == sessionId && it.partialSrc.isNotBlank()) {
+                                        it.copy(partialSrc = "", partialTgt = "", partialDraft = false)
+                                    } else it
+                                }
+                            }
+                        } else {
+                            // 无人说话：只保留 0.5 秒滚动前导缓冲，不积累长段环境杂音。
+                            current.append(chunk, window)
+                            current.trimToTail(preRollSamples)
+                        }
+
                         val emitted = drainSegments()
                         if (emitted > 0) {
                             clearCurrent()
                             draftGeneration++
-                        } else if (lastPartialText.isNotBlank() &&
+                        } else if (speechWindowsInBuf >= MIN_SPEECH_WINDOWS &&
+                            lastPartialText.isNotBlank() &&
                             SystemClock.elapsedRealtime() - lastSafetyAt > 2000 &&
                             (current.size >= 16000 * 10 ||
-                                (current.size >= 16000 * 6 && !segmenter.isSpeech()))
+                                (!isSpeechNow && (current.size >= 16000 * 6 || nonSpeechRun >= 75)))
                         ) {
                             lastSafetyAt = SystemClock.elapsedRealtime()
                             // 同样不要中途 flush，直接排空已产生的分句或兜底提交。
-                            val flushed = drainSegments()
+                            val flushed = drainSegments(flushCarry = true)
                             if (flushed > 0) {
                                 clearCurrent()
                                 draftGeneration++
                             } else {
                                 commitCurrent(
-                                    if (segmenter.isSpeech()) "强制兜底" else "识别兜底"
+                                    if (isSpeechNow) "强制兜底" else "识别兜底"
                                 )
                             }
                         }
-                        val level = rms(chunk)
+
                         if (level > 0.001f) {
                             quietWindows = 0
-                            silenceWarned = false
+                            if (silenceWarned) {
+                                silenceWarned = false
+                                _state.update {
+                                    if (it.sessionId == sessionId && it.error?.contains("输入电平≈0") == true) {
+                                        it.copy(error = null)
+                                    } else it
+                                }
+                            }
                         } else if (level < 0.0005f) {
                             quietWindows++
                         }
@@ -724,30 +893,33 @@ class LiveController(private val app: App) {
                                 } else it
                             }
                         }
-                        if (windowCount % 16 == 0L) {
+                        if (windowCount % 8 == 0L) {
+                            val activeSpeaking = isSpeechNow && (fileMode || level >= speechEnergyGate * 0.7f || speechWindowsInBuf >= 3)
                             _state.update { st ->
-                                if (st.sessionId == sessionId) st.copy(audioLevel = level) else st
+                                if (st.sessionId == sessionId) {
+                                    st.copy(audioLevel = level, speaking = activeSpeaking)
+                                } else st
                             }
                         }
                         if (windowCount % 320 == 0L) {
                             AppLog.d(
                                 "Live",
-                                "音频电平 rms=${"%.4f".format(level)} speech=${segmenter.isSpeech()} windows=$windowCount",
+                                "音频电平 rms=${"%.4f".format(level)} floor=${"%.4f".format(noiseFloor)} speech=$isSpeechNow windows=$windowCount",
                             )
                         }
-                        if (windowCount % 8 == 0L) {
-                            val speaking = segmenter.isSpeech()
-                            if (_state.value.speaking != speaking) {
-                                _state.update { it.copy(speaking = speaking) }
+                        // 文件转写全速喂入，实时预览会严重滞后且抢 CPU，直接专注最终识别。
+                        if (!fileMode && isSpeechNow && speechWindowsInBuf >= MIN_PARTIAL_SPEECH_WINDOWS) {
+                            if (current.size - lastPartialSampleSize >= 7200 &&
+                                maybePartial(current, noiseFloor)
+                            ) {
+                                lastPartialSampleSize = current.size
                             }
                         }
-                        // 文件转写全速喂入，实时预览会严重滞后且抢 CPU，直接专注最终识别。
-                        if (!fileMode) maybePartial(current, windowCount)
                     }
                 }
             }
             runCatching { segmenter.flush() }
-            val emitted = drainSegments()
+            val emitted = drainSegments(flushCarry = true)
             if (emitted == 0) commitCurrent("结束兜底")
         } finally {
             runCatching { segmenter.release() }
@@ -761,37 +933,55 @@ class LiveController(private val app: App) {
         return Math.sqrt(sum / samples.size).toFloat()
     }
 
-    private fun maybePartial(current: FloatBuf, windowCount: Long) {
+    private fun peak(samples: FloatArray): Float {
+        var m = 0f
+        for (s in samples) {
+            val a = if (s < 0f) -s else s
+            if (a > m) m = a
+        }
+        return m
+    }
+
+    private fun maybePartial(current: FloatBuf, noiseFloor: Float): Boolean {
         val settings = app.settings.value
         val now = SystemClock.elapsedRealtime()
-        if (current.size < 16000 * 0.6) return
+        if (current.size < 16000 * 0.65) return false
         val slowAsr = _state.value.lastAsrMs > 1200
-        val interval = if (slowAsr) 1800 else 900
-        if (now - lastPartialAt < interval) return
-        if (finalPending.get() > 0) return
-        if (slowAsr && (translatePending.get() > 0 || backgroundTasks.get() > 0)) return
-        if (partialInFlight) return
-        val sid = _state.value.sessionId ?: return
-        if (!_state.value.running || _state.value.paused) return
-        lastPartialAt = now
-        // 预览只取最近 6 秒（慢设备 4 秒），缩短 SenseVoice 解码时间，把 CPU 留给最终识别。
-        val partialWindow = if (slowAsr) 16000 * 4 else 16000 * 6
+        val interval = if (slowAsr) 1600 else 850
+        if (now - lastPartialAt < interval) return false
+        if (finalPending.get() > 0) return false
+        if (slowAsr && (translatePending.get() > 0 || backgroundTasks.get() > 0)) return false
+        if (partialInFlight) return false
+        val sid = _state.value.sessionId ?: return false
+        if (!_state.value.running || _state.value.paused) return false
+        // 预览只取最近 4 秒（慢设备 3 秒）：SenseVoice 自注意力与时长呈超线性关系，
+        // 缩短预览窗可提速 ~45%，同时减少占用 ASR 锁时间，让最终分句识别零等待。
+        val partialWindow = if (slowAsr) 16000 * 3 else 16000 * 4
         val samples = if (current.size > partialWindow) current.subListFrom(current.size - partialWindow) else current.toFloatArray()
-        // 静音/底噪时 SenseVoice 会产生固定幻觉（“Yeah.”“是的。”），不要显示也不要做草稿翻译。
-        if (rms(samples) < 0.0015f) return
+        val energy = rms(samples)
+        val np = noiseProfile()
+        val minEnergy = max(np.partialFloor, noiseFloor * np.partialMult)
+        if (energy < minEnergy) return false
+        lastPartialAt = now
         val epoch = bufferEpoch
         partialInFlight = true
         scope.launch(Dispatchers.IO) {
             try {
                 val partialStart = SystemClock.elapsedRealtime()
-                val (text, lang) = asr.transcribe(samples, sourceLangPref)
+                val res = asr.transcribeDetailed(samples, sourceLangPref, isPartial = true)
+                val text = res.text
                 if (text.isBlank()) return@launch
+                if (isHallucination(text, energy, samples.size / 16000.0, res.event, fileMode = false)) {
+                    AppLog.d("Live", "忽略预览杂音幻觉 text=${text.take(20)} event=${res.event} rms=${"%.4f".format(energy)}")
+                    return@launch
+                }
                 if (_state.value.sessionId != sid) return@launch
                 if (!_state.value.running || _state.value.paused) return@launch
                 // 缓冲已经换句/换会话时，这个结果属于上一段，不能写回预览或 fallback。
                 if (epoch != bufferEpoch) return@launch
                 if (text == lastPartialText) return@launch
                 lastPartialText = text
+                val lang = res.lang
                 AppLog.d(
                     "Live",
                     "预览识别 ${SystemClock.elapsedRealtime() - partialStart}ms text=${text.length}字 lang=${lang.ifBlank { sourceLangPref }}",
@@ -803,8 +993,9 @@ class LiveController(private val app: App) {
                         it.copy(partialSrc = text, partialTgt = "", partialDraft = false)
                     } else it
                 }
+                val hasEnoughForDraft = text.count { it in '\u4E00'..'\u9FFF' } >= 4 || text.length >= 10
                 if (settings.draftTranslate && settings.llmMode != SettingsData.MODE_API &&
-                    !draftSuppressed && text.length >= 3 &&
+                    !draftSuppressed && hasEnoughForDraft &&
                     SystemClock.elapsedRealtime() - lastDraftAt > DRAFT_INTERVAL_MS
                 ) {
                     lastDraftAt = SystemClock.elapsedRealtime()
@@ -818,6 +1009,7 @@ class LiveController(private val app: App) {
                 if (_state.value.sessionId == sid) partialInFlight = false
             }
         }
+        return true
     }
 
     /** 设置里的语言变化时立即生效：不必结束后重开一场。 */
@@ -853,6 +1045,7 @@ class LiveController(private val app: App) {
                     AppLog.e("Live", "最终识别任务异常", t)
                 } finally {
                     finalPending.decrementAndGet()
+                    refreshPendingQueue()
                 }
             }
         }
@@ -865,6 +1058,7 @@ class LiveController(private val app: App) {
                     AppLog.e("Live", "翻译任务异常", t)
                 } finally {
                     translatePending.decrementAndGet()
+                    refreshPendingQueue()
                 }
             }
         }
@@ -873,6 +1067,25 @@ class LiveController(private val app: App) {
             for (job in draftChannel) {
                 try {
                     handleDraft(job)
+                } catch (_: Throwable) {
+                }
+            }
+        }
+
+        // 声纹识别走低优先级串行队列，在实时识别/翻译忙碌时短暂让路，避免抢占 CPU 大核。
+        scope.launch(Dispatchers.IO) {
+            for (job in diarizeChannel) {
+                try {
+                    var waited = 0
+                    while ((finalPending.get() > 0 || translatePending.get() > 0) &&
+                        _state.value.sessionId == job.sessionId && waited < 10
+                    ) {
+                        delay(150)
+                        waited++
+                    }
+                    if (_state.value.sessionId == job.sessionId) {
+                        diarize(job.sessionId, job.segmentId, job.samples)
+                    }
                 } catch (_: Throwable) {
                 }
             }
@@ -925,14 +1138,23 @@ class LiveController(private val app: App) {
             AppLog.d("Live", "丢弃过期字幕 session=${job.sessionId} 当前=${_state.value.sessionId}")
             return
         }
+        val fileMode = _state.value.source == LiveSource.FILE
+        val segEnergy = rms(job.samples)
+        val segDurSec = job.samples.size / 16000.0
         val asrStarted = SystemClock.elapsedRealtime()
         var finalText = ""
         var lang = ""
+        var event = ""
+        var asrFailed = false
         try {
-            val pair = if (job.samples.isEmpty()) "" to "" else asr.transcribe(job.samples, job.sourceLang)
-            finalText = pair.first
-            lang = pair.second
+            if (job.samples.isNotEmpty()) {
+                val res = asr.transcribeDetailed(job.samples, job.sourceLang, isPartial = false)
+                finalText = res.text
+                lang = res.lang
+                event = res.event
+            }
         } catch (t: Throwable) {
+            asrFailed = true
             AppLog.e("Live", "最终识别异常 len=${job.samples.size} samples", t)
         }
         val asrMs = SystemClock.elapsedRealtime() - asrStarted
@@ -944,44 +1166,68 @@ class LiveController(private val app: App) {
         _state.update {
             if (it.sessionId == job.sessionId) it.copy(lastAsrMs = asrMs) else it
         }
-        val usedFallback = finalText.isBlank() && job.fallbackText.isNotBlank()
-        val text = finalText.ifBlank { job.fallbackText }
+        // 识别结果若被判定为环境杂音/非语音事件/低能量幻觉，直接丢弃，不要回退到同样可能失真的预览文本。
+        val filteredNoise = !asrFailed && finalText.isNotBlank() &&
+            isHallucination(finalText, segEnergy, segDurSec, event, fileMode = fileMode)
+        if (filteredNoise) {
+            AppLog.d(
+                "Live",
+                "过滤杂音幻觉 text=${finalText.take(24)} event=$event rms=${"%.4f".format(segEnergy)} dur=${"%.2f".format(segDurSec)}s",
+            )
+            _state.update { st ->
+                val cleaned = if (job.provisionalId != null) {
+                    st.segments.filterNot { it.id == job.provisionalId }
+                } else st.segments
+                val clearPartial = st.partialSrc == job.fallbackText
+                st.copy(
+                    segments = cleaned,
+                    partialSrc = if (clearPartial) "" else st.partialSrc,
+                    partialTgt = if (clearPartial) "" else st.partialTgt,
+                    partialDraft = if (clearPartial) false else st.partialDraft,
+                )
+            }
+            return
+        }
+        // 仅当 ASR 抛异常或样本为空时才使用 fallbackText；若 SenseVoice 正常把静音解为空，不再用预览幻觉顶替。
+        val usedFallback = finalText.isBlank() && (asrFailed || job.samples.isEmpty()) && job.fallbackText.isNotBlank()
+        val text = if (usedFallback) job.fallbackText else finalText
         if (lang.isBlank()) {
             lang = if (job.sourceLang != "auto") job.sourceLang else guessLanguage(text)
         }
         AppLog.d(
             "Live",
-            "最终识别 ${asrMs}ms len=${job.samples.size / 16000.0}s text=${text.length}字 fallback=$usedFallback asrStatus=${asr.status.value}"
+            "最终识别 ${asrMs}ms len=${"%.2f".format(segDurSec)}s rms=${"%.4f".format(segEnergy)} event=$event " +
+                "text=${text.length}字 fallback=$usedFallback asrStatus=${asr.status.value}"
         )
         if (text.isBlank()) {
-            emptyFinals++
-            AppLog.e("Live", "最终识别为空，保留预览文本并等待下一次说话")
-            _state.update {
-                it.copy(
-                    status = "这一段没有识别到文字",
-                    error = if (emptyFinals >= 3 && it.error == null) {
+            // 仅在音频有明显人声能量（>=0.015）却连续解出空文本时告警，避免安静杂音误报故障。
+            if (segEnergy >= 0.015f || asrFailed) emptyFinals++
+            _state.update { st ->
+                val cleaned = if (job.provisionalId != null) {
+                    st.segments.filterNot { it.id == job.provisionalId }
+                } else st.segments
+                val clearPartial = st.partialSrc == job.fallbackText
+                st.copy(
+                    segments = cleaned,
+                    partialSrc = if (clearPartial) "" else st.partialSrc,
+                    partialTgt = if (clearPartial) "" else st.partialTgt,
+                    partialDraft = if (clearPartial) false else st.partialDraft,
+                    error = if (emptyFinals >= 3 && st.error == null) {
                         "连续多句没有识别到文字：请检查音源音量、识别模型或识别线程设置"
-                    } else it.error,
+                    } else st.error,
                 )
             }
             return
         }
         emptyFinals = 0
         val low = looksLowConfidence(text) || usedFallback
-        var audioPath: String? = null
-        if (settings.keepAudio && job.samples.isNotEmpty()) {
-            val idx = segmentIndex++
-            val f: File = app.repo.audioFile(job.sessionId, idx)
-            val written = runCatching { WavUtil.write(f, job.samples) }.isSuccess
-            audioPath = if (written) f.absolutePath else null
-        }
         var saved = true
         val id = try {
             withContext(Dispatchers.IO) {
                 app.db.addSegment(
                     job.sessionId, job.t0, job.t1,
                     lang,
-                    text, audioPath, low,
+                    text, null, low,
                 )
             }
         } catch (t: Throwable) {
@@ -990,11 +1236,11 @@ class LiveController(private val app: App) {
             _state.update {
                 it.copy(error = "字幕保存失败：可能存储空间不足。本句仍会显示，请清理空间后重试。")
             }
-            -(System.nanoTime() and 0x7fffffffL).coerceAtLeast(1)
+            nextTempId.decrementAndGet()
         }
         val seg = LiveSegment(
             id = id, t0 = job.t0, t1 = job.t1, srcLang = lang, src = text, tgt = "",
-            lowConfidence = low, audioPath = audioPath,
+            lowConfidence = low, audioPath = null,
         )
         AppLog.d("Live", if (saved) "字幕入库 id=$id t0=${"%.2f".format(job.t0)}" else "字幕仅显示未入库 id=$id")
         _state.update {
@@ -1002,10 +1248,15 @@ class LiveController(private val app: App) {
             else {
                 val clearPartial = it.partialSrc == job.fallbackText || it.partialSrc.isBlank()
                 val provisionalIndex = job.provisionalId?.let { pid ->
-                    it.segments.indexOfFirst { s -> s.id == pid }
+                    it.segments.indexOfLast { s -> s.id == pid }
                 } ?: -1
                 val segments = if (provisionalIndex >= 0) {
-                    it.segments.toMutableList().also { list -> list[provisionalIndex] = seg }
+                    val existing = it.segments[provisionalIndex]
+                    // 保留临时行里已有的草稿译文（斜体过渡），避免先退回「译文中…」闪烁再出现最终译文。
+                    val merged = if (existing.draftTgt && existing.tgt.isNotBlank()) {
+                        seg.copy(tgt = existing.tgt, draftTgt = true)
+                    } else seg
+                    it.segments.toMutableList().also { list -> list[provisionalIndex] = merged }
                 } else {
                     it.segments + seg
                 }
@@ -1017,21 +1268,32 @@ class LiveController(private val app: App) {
                 )
             }
         }
-        AppLog.d("Live", "当前显示 ${_state.value.segments.size} 句")
+        // 先取消正在进行的草稿并立即下发正式翻译，把 WAV 落盘和声纹识别移出关键路径，最小化首字延迟。
+        draftGeneration++
+        translationEpoch++
+        if (draftInFlight.get() > 0 && !finalTranslating) app.llm.cancelTranslation()
         translatePending.incrementAndGet()
+        refreshPendingQueue()
         translateChannel.send(
             TranslateJob(
                 job.sessionId, id, text, lang, job.endedAtMs,
-                job.targetLang, job.glossary, job.courseId, settings,
+                job.targetLang, glossaryText.ifBlank { job.glossary }, job.courseId, settings,
                 job.vadEndWallMs, asrDoneWallMs,
             )
         )
-        draftGeneration++
-        translationEpoch++
-        // 只取消草稿：校正和答案翻译也在 backgroundTasks 里，被新句子打断会留下半截结果。
-        if (draftInFlight.get() > 0 && !finalTranslating) app.llm.cancelTranslation()
-        if (settings.diarization) {
-            scope.launch { diarize(job.sessionId, id, job.samples) }
+        if (settings.keepAudio && job.samples.isNotEmpty() && saved && id > 0) {
+            val idx = segmentIndex++
+            scope.launch(Dispatchers.IO) {
+                val f: File = app.repo.audioFile(job.sessionId, idx)
+                if (runCatching { WavUtil.write(f, job.samples) }.isSuccess) {
+                    val path = f.absolutePath
+                    runCatching { app.db.updateSegmentAudioPath(id, path) }
+                    updateSegment(id) { it.copy(audioPath = path) }
+                }
+            }
+        }
+        if (settings.diarization && job.samples.isNotEmpty()) {
+            diarizeChannel.trySend(DiarizeJob(job.sessionId, id, job.samples))
         }
     }
 
@@ -1046,6 +1308,7 @@ class LiveController(private val app: App) {
         )
         val sb = StringBuilder()
         var firstAt = 0L
+        var lastUiPushAt = 0L
         finalTranslating = true
         val translationStartedAt = SystemClock.elapsedRealtime()
         val queuedMs = translationStartedAt - job.finalizedAt
@@ -1057,28 +1320,47 @@ class LiveController(private val app: App) {
             // 本地模型版本和线程跟随当前设置，避免旧任务把刚加载的新模型又换回去。
             val cfg = if (job.settings.llmMode == SettingsData.MODE_API) job.settings
             else job.settings.copy(modelVariant = settings.modelVariant, llmThreads = settings.llmThreads)
+            // 按设置提取当前句之前的 N 句原文作为轻量上下文，显著提升代词与跨句连贯度，
+            // 且上下文放在 user 消息中，不破坏 System Prompt + 术语表的 KV Prefix Cache。
+            val ctxCount = settings.translationContext.coerceIn(0, 3)
+            val prevContext = if (ctxCount > 0 && _state.value.sessionId == job.sessionId) {
+                val segs = _state.value.segments
+                val idx = segs.indexOfLast { it.id == job.segmentId }
+                val prior = if (idx > 0) segs.subList((idx - ctxCount).coerceAtLeast(0), idx) else emptyList()
+                prior.map { it.src.trim() }.filter { it.isNotEmpty() }.joinToString("\n")
+            } else ""
+            // 按源句长度动态设定 token 上限：短句不给冗余预算，长句充足，同时防止异常复读拖死队列。
+            val dynamicMaxTokens = (job.text.length * 3 + 48).coerceIn(64, 280)
             val result = app.llm.translate(
                 text = job.text,
                 srcLang = job.srcLang,
                 target = job.targetLang,
                 glossary = job.glossary,
-                maxTokens = 320,
-                temperature = 0.2f,
+                maxTokens = dynamicMaxTokens,
+                // 本地模型使用 0.0f 贪心解码（跳过全词表 top_p 排序与采样，速度最快且译文稳定）。
+                temperature = if (cfg.llmMode == SettingsData.MODE_API) 0.1f else 0.0f,
                 config = cfg,
+                context = prevContext,
             ) { piece ->
-                if (sb.isEmpty() && firstAt == 0L) {
-                    firstAt = SystemClock.elapsedRealtime()
+                val now = SystemClock.elapsedRealtime()
+                val isFirst = sb.isEmpty() && firstAt == 0L
+                if (isFirst) {
+                    firstAt = now
                     if (job.vadEndWallMs > 0L) {
-                        val now = System.currentTimeMillis()
+                        val wall = System.currentTimeMillis()
                         AppLog.d(
                             "Lat",
                             "segId=${job.segmentId} vadEnd=${job.vadEndWallMs} asrDone=${job.asrDoneWallMs} " +
-                                "firstToken=$now finalDone=0",
+                                "firstToken=$wall finalDone=0",
                         )
                     }
                 }
                 sb.append(piece)
-                updateSegment(job.segmentId) { it.copy(tgt = sb.toString()) }
+                // 首字 0ms 立即上屏；后续流式每 45ms 合并刷新一次，减少 Compose 重组开销与 CPU 争抢。
+                if (isFirst || now - lastUiPushAt >= 45L) {
+                    lastUiPushAt = now
+                    updateSegment(job.segmentId) { it.copy(tgt = sb.toString(), draftTgt = false) }
+                }
             }
             val finalText = result.ifBlank { sb.toString() }.trim()
             if (job.vadEndWallMs > 0L) {
@@ -1089,7 +1371,7 @@ class LiveController(private val app: App) {
                 )
             }
             if (finalText.isNotBlank()) {
-                updateSegment(job.segmentId) { it.copy(tgt = finalText) }
+                updateSegment(job.segmentId) { it.copy(tgt = finalText, draftTgt = false) }
                 runCatching {
                     withContext(Dispatchers.IO) { app.db.updateSegmentTranslation(job.segmentId, finalText) }
                 }.onFailure { AppLog.e("Live", "保存译文失败", it) }
@@ -1113,9 +1395,10 @@ class LiveController(private val app: App) {
             AppLog.e("Live", "翻译失败 segment=${job.segmentId} text=${job.text.take(40)}", e)
             updateSegment(job.segmentId) {
                 it.copy(
-                    tgt = if (it.tgt.isBlank() || it.tgt == "译文中…")
+                    tgt = if (it.tgt.isBlank() || it.tgt == "译文中…" || it.draftTgt)
                         "（翻译失败：${e.message?.take(80) ?: "未知错误"}）"
-                    else it.tgt
+                    else it.tgt,
+                    draftTgt = false,
                 )
             }
             if (settings.autoQuestion && settings.assistantEnabled &&
@@ -1125,6 +1408,17 @@ class LiveController(private val app: App) {
             }
         } finally {
             finalTranslating = false
+            // 补译模式：最后一条任务完成时自动将状态从「正在补译…」更新为「补译完成」。
+            if (!_state.value.running && translatePending.get() <= 1 &&
+                _state.value.sessionId == job.sessionId &&
+                _state.value.status.startsWith("正在补译")
+            ) {
+                _state.update {
+                    if (!it.running && it.sessionId == job.sessionId && it.status.startsWith("正在补译")) {
+                        it.copy(status = "补译完成")
+                    } else it
+                }
+            }
         }
     }
 
@@ -1134,6 +1428,7 @@ class LiveController(private val app: App) {
         if (app.settings.value.llmMode == SettingsData.MODE_API) return
         if (translatePending.get() > 0 || finalPending.get() > 0) return
         val sb = StringBuilder()
+        var lastUiPushAt = 0L
         backgroundTasks.incrementAndGet()
         draftInFlight.incrementAndGet()
         try {
@@ -1142,18 +1437,29 @@ class LiveController(private val app: App) {
                 srcLang = job.srcLang,
                 target = targetLangPref,
                 glossary = glossaryText,
-                // 草稿只求「先看到大意」：限长 + 小 token 预算，避免抢走最终翻译的算力。
+                // 草稿只求「先看到大意」：贪心 + 小 token 预算，避免抢走最终翻译的算力。
                 maxTokens = DRAFT_MAX_TOKENS,
-                temperature = 0.15f,
+                temperature = 0.0f,
                 allowEmpty = true,
             ) { piece ->
-                // 草稿够长就停止上屏（生成仍会结束，但不再追加内容）。
-                if (sb.length >= DRAFT_MAX_CHARS) return@translate
-                if (job.generation == draftGeneration && job.text == lastPartialText) {
-                    sb.append(piece)
+                if (job.generation != draftGeneration || job.text != lastPartialText ||
+                    translatePending.get() > 0 || finalPending.get() > 0
+                ) {
+                    if (!finalTranslating) app.llm.cancelTranslation()
+                    return@translate
+                }
+                sb.append(piece)
+                val now = SystemClock.elapsedRealtime()
+                if (lastUiPushAt == 0L || now - lastUiPushAt >= 50L || sb.length >= DRAFT_MAX_CHARS) {
+                    lastUiPushAt = now
+                    val preview = sb.toString()
                     _state.update {
-                        if (it.running && !it.paused) it.copy(partialTgt = sb.toString(), partialDraft = true) else it
+                        if (it.running && !it.paused) it.copy(partialTgt = preview, partialDraft = true) else it
                     }
+                }
+                // 草稿够长立刻中止原生推理，不再在后台继续生成消耗 CPU 与占锁。
+                if (sb.length >= DRAFT_MAX_CHARS && !finalTranslating) {
+                    app.llm.cancelTranslation()
                 }
             }
         } catch (_: Throwable) {
@@ -1209,6 +1515,8 @@ class LiveController(private val app: App) {
             }
             val chosen: LiveSpeaker = when {
                 best != null && bestScore >= 0.62 -> best!!
+                // 短于 0.8 秒的碎片声纹不稳定：优先归到最接近的已有说话人，避免误拆出很多假说话人。
+                samples.size < 12800 && best != null -> best!!
                 speakers.size >= 6 -> best ?: return
                 else -> {
                     val idx = speakers.size
@@ -1226,7 +1534,9 @@ class LiveController(private val app: App) {
             runCatching {
                 withContext(Dispatchers.IO) { app.db.setSegmentSpeaker(segmentId, chosen.id) }
             }.onFailure { AppLog.e("Live", "保存说话人失败", it) }
-            updateSegment(segmentId) { it.copy(speaker = chosen.label, speakerColor = chosen.color) }
+            updateSegment(segmentId) {
+                it.copy(speaker = chosen.label, speakerColor = chosen.color, speakerId = chosen.id)
+            }
         }
     }
 
@@ -1257,7 +1567,7 @@ class LiveController(private val app: App) {
         val st = _state.value
         val sessionId = st.sessionId ?: return
         if (!st.running && !manual) return
-        val localId = -(System.nanoTime() and 0x7fffffffL).coerceAtLeast(1)
+        val localId = nextTempId.decrementAndGet()
         _state.update {
             it.copy(
                 questions = listOf(
@@ -1292,29 +1602,30 @@ class LiveController(private val app: App) {
             val history = _state.value.segments.takeLast(20)
                 .joinToString("\n") { "- ${it.src} / ${it.tgt}" }
             val cid = job.courseId
-            val course = if (cid != null) {
+            var courseCtx = ""
+            var materialText = ""
+            if (cid != null) {
                 val chunks = withContext(Dispatchers.IO) { app.db.topMaterialChunks(cid, job.question, 4) }
-                val ctx = withContext(Dispatchers.IO) { app.db.courseContext(cid) }
-                buildString {
-                    if (ctx.isNotBlank()) appendLine("课程背景：\n$ctx\n")
-                    if (chunks.isNotEmpty()) {
-                        appendLine("课件片段：")
-                        chunks.forEach { appendLine("[${it.materialName} 第${it.page}页] ${it.text}") }
-                    }
-                }.trim()
-            } else ""
-            val body = buildString {
-                appendLine("课堂记录：\n${history.ifBlank { "（暂无）" }}")
-                if (course.isNotBlank()) appendLine("\n$course")
+                courseCtx = withContext(Dispatchers.IO) { app.db.courseContext(cid) }.trim()
+                if (chunks.isNotEmpty()) {
+                    materialText = chunks.joinToString("\n") {
+                        "[${it.materialName} 第${it.page}页] ${it.text}"
+                    }.trim()
+                }
             }
-            // 分开限额：整体 take() 只保头部，课件片段在末尾会被整段丢掉。
+            // 三段独立限额：课堂记录保留末尾（最新）2200 字，课件片段独立预留 1600 字，
+            // 课程背景 1000 字，避免长课程背景或旧字幕把刚检索到的课件片段裁掉。
             val historyCap = 2200
-            val courseCap = 2400
+            val materialCap = 1600
+            val ctxCap = 1000
             val trimmed = buildString {
                 val h = history.ifBlank { "（暂无）" }
-                appendLine("课堂记录：\n${if (h.length > historyCap) h.take(historyCap) else h}")
-                if (course.isNotBlank()) {
-                    appendLine("\n" + (if (course.length > courseCap) course.take(courseCap) else course))
+                appendLine("课堂记录：\n${if (h.length > historyCap) h.takeLast(historyCap) else h}")
+                if (materialText.isNotBlank()) {
+                    appendLine("\n课件片段：\n${if (materialText.length > materialCap) materialText.take(materialCap) else materialText}")
+                }
+                if (courseCtx.isNotBlank()) {
+                    appendLine("\n课程背景：\n${if (courseCtx.length > ctxCap) courseCtx.take(ctxCap) else courseCtx}")
                 }
             }
             val prompt = "$trimmed\n\n问题：${job.question}"
@@ -1462,32 +1773,33 @@ class LiveController(private val app: App) {
             else "上一版要点：\n$previous\n\n最近的字幕：\n$lines"
             _state.update { it.copy(assistantBusy = true) }
             val sb = StringBuilder()
-            val text = try {
-                app.llm.analyze(Prompts.SUMMARY_SYSTEM, prompt, maxTokens = 300, temperature = 0.3f) { piece ->
+            try {
+                val text = app.llm.analyze(Prompts.SUMMARY_SYSTEM, prompt, maxTokens = 300, temperature = 0.3f) { piece ->
                     sb.append(piece)
                     if (_state.value.sessionId == sessionAtStart) {
                         _state.update { it.copy(summary = sb.toString()) }
                     }
                 }
+                if (!text.isNullOrBlank()) {
+                    if (_state.value.sessionId != sessionAtStart) return
+                    _state.update { it.copy(summary = text.trim()) }
+                    summaryIndex = segments.size
+                    lastSummaryAt = now
+                    runCatching {
+                        withContext(Dispatchers.IO) { app.db.addSummary(sessionAtStart, text.trim()) }
+                    }.onFailure { AppLog.e("Live", "保存要点失败", it) }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (t: Throwable) {
                 AppLog.e("Live", "生成要点失败", t)
                 if (_state.value.sessionId == sessionAtStart) {
                     lastSummaryAt = now
+                }
+            } finally {
+                if (_state.value.sessionId == sessionAtStart) {
                     _state.update { it.copy(assistantBusy = false) }
                 }
-                return
-            }
-            if (!text.isNullOrBlank()) {
-                if (_state.value.sessionId != sessionAtStart) return
-                _state.update { it.copy(summary = text.trim()) }
-                summaryIndex = segments.size
-                lastSummaryAt = now
-                runCatching {
-                    withContext(Dispatchers.IO) { app.db.addSummary(sessionAtStart, text.trim()) }
-                }.onFailure { AppLog.e("Live", "保存要点失败", it) }
-            }
-            if (_state.value.sessionId == sessionAtStart) {
-                _state.update { it.copy(assistantBusy = false) }
             }
         }
     }
@@ -1507,19 +1819,29 @@ class LiveController(private val app: App) {
                 val body = items.joinToString("\n") { "- ${it.src} / ${it.tgt}" }
                 val sb = StringBuilder()
                 try {
-                    app.llm.analyze(Prompts.RECAP_SYSTEM, "课堂内容：\n$body", 340, 0.3f) { piece ->
+                    val result = app.llm.analyze(Prompts.RECAP_SYSTEM, "课堂内容：\n$body", 340, 0.3f) { piece ->
                         sb.append(piece)
                         if (_state.value.sessionId == sessionAtStart) {
                             _state.update { it.copy(summary = sb.toString()) }
                         }
                     }
-                    if (sb.isNotBlank() && _state.value.sessionId == sessionAtStart) {
-                        _state.update { it.copy(summary = sb.toString().trim()) }
+                    val finalText = (result ?: sb.toString()).trim()
+                    if (finalText.isNotBlank() && _state.value.sessionId == sessionAtStart) {
+                        _state.update { it.copy(summary = finalText) }
+                    } else if (result == null && _state.value.sessionId == sessionAtStart && _state.value.summary.isBlank()) {
+                        _state.update { it.copy(summary = "助教模型未就绪，请到设置下载助教模型或配置 API。") }
                     }
-                } catch (_: Throwable) {
-                }
-                if (_state.value.sessionId == sessionAtStart) {
-                    _state.update { it.copy(assistantBusy = false) }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    AppLog.e("Live", "最近总结失败", t)
+                    if (_state.value.sessionId == sessionAtStart && _state.value.summary.isBlank()) {
+                        _state.update { it.copy(summary = "总结失败：${t.message?.take(60) ?: "未知错误"}") }
+                    }
+                } finally {
+                    if (_state.value.sessionId == sessionAtStart) {
+                        _state.update { it.copy(assistantBusy = false) }
+                    }
                 }
             }
         }
@@ -1534,13 +1856,14 @@ class LiveController(private val app: App) {
         if (routeRestarting) return
         val st = _state.value
         val old = capture
-        if (!st.running || st.paused || st.source != LiveSource.MIC || old == null) return
+        if (!st.running || st.stopping || st.paused || st.source != LiveSource.MIC || old == null) return
         routeRestarting = true
         try {
             val ctx = app.applicationContext
             val channel = audioChannel ?: return
             AppLog.d("Live", "麦克风路由变化（$reason），重建采集")
             runCatching { old.stop() }
+            if (!_state.value.running || _state.value.stopping || audioChannel !== channel) return
             val fresh = com.localinterpreter.tablet.audio.MicCapture(
                 ctx,
                 { frames -> lastAudioAt = SystemClock.elapsedRealtime(); channel.trySend(frames) },
@@ -1553,6 +1876,11 @@ class LiveController(private val app: App) {
                 },
             )
             fresh.start()
+            // 防止重建期间 stop() 已结束会话，避免泄漏一个正在后台录音的 AudioRecord。
+            if (!_state.value.running || _state.value.stopping || audioChannel !== channel) {
+                runCatching { fresh.stop() }
+                return
+            }
             capture = fresh
             AppLog.d("Live", "麦克风采集已重建")
         } catch (t: Throwable) {
@@ -1773,6 +2101,7 @@ class LiveController(private val app: App) {
                         speakerColor = sp?.color,
                         lowConfidence = g.lowConfidence,
                         audioPath = g.audioPath,
+                        speakerId = g.speakerId,
                     )
                 },
                 summary = summary,
@@ -1791,20 +2120,21 @@ class LiveController(private val app: App) {
 
     fun retranslateMissing() {
         val st = _state.value
-        if (st.running) return
+        if (st.running || st.starting || translatePending.get() > 0) return
         val sid = st.sessionId ?: return
         val missing = st.segments.filter {
             it.tgt.isBlank() || it.tgt.startsWith("（翻译失败") || it.tgt.startsWith("（未翻译")
         }
         if (missing.isEmpty()) return
         val config = app.settings.value
+        val target = config.targetLang.ifBlank { targetLangPref }
         missing.forEach { seg ->
-            updateSegment(seg.id) { it.copy(tgt = "译文中…") }
+            updateSegment(seg.id) { it.copy(tgt = "译文中…", draftTgt = false) }
             translatePending.incrementAndGet()
             translateChannel.trySend(
                 TranslateJob(
                     sid, seg.id, seg.src, seg.srcLang, SystemClock.elapsedRealtime(),
-                    targetLangPref, glossaryText, courseId, config,
+                    target, glossaryText, courseId, config,
                 )
             )
         }
@@ -1861,15 +2191,28 @@ class LiveController(private val app: App) {
         }
     }
 
-    fun bookmark() {
+    fun bookmark(): Boolean = bookmarkSegment(null)
+
+    fun bookmarkSegment(segmentId: Long? = null): Boolean {
         val st = _state.value
-        val sid = st.sessionId ?: return
-        val seg = st.segments.lastOrNull() ?: return
-        if (seg.id <= 0) return
-        scope.launch(Dispatchers.IO) {
-            runCatching { app.db.addBookmark(sid, seg.id) }
-                .onFailure { AppLog.e("Live", "保存标记失败", it) }
+        val sid = st.sessionId ?: return false
+        val seg = if (segmentId != null) {
+            st.segments.firstOrNull { it.id == segmentId && it.id > 0 }
+        } else {
+            st.segments.lastOrNull { it.id > 0 }
+        } ?: return false
+        if (!seg.bookmarked) {
+            _state.update { cur ->
+                cur.copy(segments = cur.segments.map {
+                    if (it.id == seg.id) it.copy(bookmarked = true) else it
+                })
+            }
+            scope.launch(Dispatchers.IO) {
+                runCatching { app.db.addBookmark(sid, seg.id) }
+                    .onFailure { AppLog.e("Live", "保存标记失败", it) }
+            }
         }
+        return true
     }
 
     fun updateAssistantEnabled(enabled: Boolean) {
@@ -1877,43 +2220,201 @@ class LiveController(private val app: App) {
     }
 
     fun renameSpeaker(speakerId: Long, label: String) {
+        val clean = label.trim()
+        if (clean.isBlank()) return
         scope.launch(Dispatchers.IO) {
-            runCatching { app.db.renameSpeaker(speakerId, label) }
+            runCatching { app.db.renameSpeaker(speakerId, clean) }
                 .onFailure { AppLog.e("Live", "重命名说话人失败", it) }
             val old = speakers.firstOrNull { it.id == speakerId }?.label
             speakers.indexOfFirst { it.id == speakerId }.takeIf { it >= 0 }?.let { idx ->
-                speakers[idx] = speakers[idx].copy(label = label)
+                speakers[idx] = speakers[idx].copy(label = clean)
             }
-            if (old != null) {
-                _state.update { st ->
-                    st.copy(segments = st.segments.map {
-                        if (it.speaker == old) it.copy(speaker = label) else it
-                    })
-                }
+            _state.update { st ->
+                st.copy(segments = st.segments.map {
+                    if (it.speakerId == speakerId || (old != null && it.speaker == old)) {
+                        it.copy(speaker = clean)
+                    } else it
+                })
             }
+        }
+    }
+
+    /** 课中/课后单句快速重译（可带入最新术语表与目标语言）。 */
+    fun retranslateSegment(segmentId: Long): Boolean {
+        val st = _state.value
+        val sid = st.sessionId ?: return false
+        val seg = st.segments.lastOrNull { it.id == segmentId } ?: return false
+        if (seg.src.isBlank() || seg.id <= 0) return false
+        val config = app.settings.value
+        val target = config.targetLang.ifBlank { targetLangPref }
+        updateSegment(seg.id) { it.copy(tgt = "译文中…", draftTgt = false) }
+        translatePending.incrementAndGet()
+        refreshPendingQueue()
+        translateChannel.trySend(
+            TranslateJob(
+                sid, seg.id, seg.src, seg.srcLang.ifBlank { guessLanguage(seg.src) },
+                SystemClock.elapsedRealtime(), target, glossaryText, courseId, config,
+            )
+        )
+        draftGeneration++
+        translationEpoch++
+        return true
+    }
+
+    /** 修正单句识别原文并立即保存、触发重新翻译。 */
+    fun editAndRetranslateSegment(segmentId: Long, newSource: String): Boolean {
+        val clean = newSource.trim()
+        if (clean.isBlank()) return false
+        val st = _state.value
+        val sid = st.sessionId ?: return false
+        val seg = st.segments.lastOrNull { it.id == segmentId } ?: return false
+        if (seg.id <= 0) return false
+        val lang = seg.srcLang.ifBlank { guessLanguage(clean) }
+        updateSegment(seg.id) { it.copy(src = clean, tgt = "译文中…", corrected = true, draftTgt = false) }
+        scope.launch(Dispatchers.IO) {
+            runCatching { app.db.updateSegmentSource(seg.id, clean) }
+                .onFailure { AppLog.e("Live", "保存修改原文失败", it) }
+        }
+        val config = app.settings.value
+        val target = config.targetLang.ifBlank { targetLangPref }
+        translatePending.incrementAndGet()
+        refreshPendingQueue()
+        translateChannel.trySend(
+            TranslateJob(
+                sid, seg.id, clean, lang, SystemClock.elapsedRealtime(),
+                target, glossaryText, courseId, config,
+            )
+        )
+        draftGeneration++
+        translationEpoch++
+        return true
+    }
+
+    /** 同传进行中向当前绑定课程快速添加术语，立即刷新内存术语表，下一句翻译立刻生效。 */
+    fun addLiveGlossaryTerm(term: String, translation: String, onDone: (Boolean) -> Unit = {}) {
+        val cid = courseId ?: _state.value.courseId
+        val cleanTerm = term.trim()
+        val cleanTrans = translation.trim()
+        if (cid == null || cleanTerm.isBlank() || cleanTrans.isBlank()) {
+            onDone(false)
+            return
+        }
+        scope.launch(Dispatchers.IO) {
+            val ok = runCatching {
+                app.db.addGlossary(cid, cleanTerm, cleanTrans)
+                glossaryText = app.db.glossaryPrompt(cid)
+            }.onFailure { AppLog.e("Live", "实时添加术语失败", it) }.isSuccess
+            withContext(Dispatchers.Main) { onDone(ok) }
         }
     }
 
     private fun updateSegment(id: Long, block: (LiveSegment) -> LiveSegment) {
         _state.update { st ->
-            st.copy(segments = st.segments.map { if (it.id == id) block(it) else it })
+            val idx = st.segments.indexOfLast { it.id == id }
+            if (idx < 0) return@update st
+            val updated = block(st.segments[idx])
+            if (updated == st.segments[idx]) return@update st
+            val copy = st.segments.toMutableList()
+            copy[idx] = updated
+            st.copy(segments = copy)
         }
     }
 
     private fun updateQuestion(localId: Long, block: (LiveQuestion) -> LiveQuestion) {
         _state.update { st ->
-            st.copy(questions = st.questions.map { if (it.id == localId) block(it) else it })
+            val idx = st.questions.indexOfFirst { it.id == localId }
+            if (idx < 0) return@update st
+            val copy = st.questions.toMutableList()
+            copy[idx] = block(copy[idx])
+            st.copy(questions = copy)
         }
     }
 
     private fun guessLanguage(text: String): String {
-        val cjk = text.count { it in '一'..'鿿' }
+        val kana = text.count { it in '\u3040'..'\u30FF' }
+        val hangul = text.count { it in '\uAC00'..'\uD7A3' }
+        val cjk = text.count { it in '\u4E00'..'\u9FFF' }
         val latin = text.count { it in 'a'..'z' || it in 'A'..'Z' }
         return when {
+            kana >= 2 -> "ja"
+            hangul >= 2 -> "ko"
             cjk > latin && cjk > 0 -> "zh"
             latin > cjk && latin > 0 -> "en"
             else -> ""
         }
+    }
+
+    /**
+     * 过滤 SenseVoice 在无人说话或轻微环境杂音（空调、翻页、敲击、远场底噪）下产生的乱码与固定幻觉。
+     * 结合 SenseVoice 事件标签、音频能量、时长及重复/单字特征综合判定，尽量做到“杂音不乱出字，正常说话不漏字”。
+     */
+    private fun isHallucination(
+        text: String,
+        energy: Float,
+        durationSec: Double,
+        event: String,
+        fileMode: Boolean,
+    ): Boolean {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return true
+        val stripped = trimmed.filter { it.isLetterOrDigit() }
+        // 纯标点、空白或音乐符号（如 "。"、"..."、"♪"）直接丢弃。
+        if (stripped.isEmpty()) return true
+
+        val halluEnergy = noiseProfile().hallucinationEnergy
+
+        // SenseVoice 显式标记为非语音事件（BGM/掌声/笑声/咳嗽/喷嚏/噪声等）时，短片段直接视为杂音。
+        val isNonSpeechEvent = event.isNotBlank() &&
+            !event.equals("Speech", ignoreCase = true) &&
+            !event.equals("Event_UNK", ignoreCase = true)
+        if (isNonSpeechEvent) {
+            if (stripped.length <= 4) return true
+            if (energy < halluEnergy && stripped.length <= 8) return true
+        }
+
+        // 连续单字符重复幻觉（如 "啊啊啊啊啊"、"嗯嗯嗯嗯嗯"、"eeeee"）。
+        if (stripped.length >= 4) {
+            var maxRun = 1
+            var run = 1
+            for (i in 1 until stripped.length) {
+                if (stripped[i].lowercaseChar() == stripped[i - 1].lowercaseChar() && !stripped[i].isDigit()) {
+                    run++
+                    if (run > maxRun) maxRun = run
+                } else {
+                    run = 1
+                }
+            }
+            if (maxRun >= 5 && maxRun >= stripped.length * 0.6) return true
+        }
+
+        // 连续重复同一个短词（如 "the the the the" / "la la la la"）。
+        val words = trimmed.lowercase().split(Regex("[\\s,，.。!！?？]+")).filter { it.isNotEmpty() }
+        if (words.size >= 4 && words.distinct().size == 1 && words[0].length <= 4) {
+            return true
+        }
+
+        // 文件转写通常是清晰录制的音频，仅拦截上述明显纯符号/非语音/死循环幻觉，避免误伤。
+        if (fileMode) return false
+
+        // 单个英文字母（如 "a" / "t" / "o"）在实时同传里几乎必然是杂音误识。
+        if (stripped.length == 1 && (stripped[0] in 'a'..'z' || stripped[0] in 'A'..'Z')) {
+            return true
+        }
+
+        // 单个汉字/假名/韩文在偏低能量或极短片段下多为杂音幻觉；大声清晰说出仍放行。
+        if (stripped.length == 1 && (energy < halluEnergy * 0.95f || durationSec < 0.65)) {
+            return true
+        }
+
+        // SenseVoice 在轻微底噪下高频吐出的固定语气词/单字幻觉：仅当能量偏低、过短或非 Speech 事件时丢弃。
+        val normalized = stripped.lowercase()
+        if (normalized in NOISE_HALLUCINATIONS &&
+            (energy < halluEnergy || durationSec < 0.8 || isNonSpeechEvent)
+        ) {
+            return true
+        }
+
+        return false
     }
 
     private fun looksLowConfidence(text: String): Boolean {
@@ -1939,8 +2440,23 @@ class LiveController(private val app: App) {
         private val speakerColors = listOf("#4fd1a5", "#7aa2ff", "#f0b45c", "#e07ad1", "#8bd46a", "#f07070")
         /** 小于 0.4 秒（16k 采样）的 VAD 片段先攒着，与下一句合并后再识别。 */
         private const val MIN_SEGMENT_SAMPLES = 6400
+        /** 尾巴/超时刷出碎片的最短时长（0.28 秒），短于此多为瞬时杂音。 */
+        private const val MIN_CARRY_FLUSH_SAMPLES = 4480
+        /** 缓冲内至少包含 14 帧（约 0.45 秒）真实人声窗口，才允许兜底提交。 */
+        private const val MIN_SPEECH_WINDOWS = 14
+        /** 预览识别至少需要 12 帧（约 0.38 秒）真实人声窗口，避免轻微杂音触发预览幻觉。 */
+        private const val MIN_PARTIAL_SPEECH_WINDOWS = 12
         private const val DRAFT_INTERVAL_MS = 1200L
-        private const val DRAFT_MAX_TOKENS = 48
-        private const val DRAFT_MAX_CHARS = 80
+        private const val DRAFT_MAX_TOKENS = 32
+        private const val DRAFT_MAX_CHARS = 72
+        private val NOISE_HALLUCINATIONS = setOf(
+            "嗯", "啊", "哦", "呃", "诶", "哎", "呀", "吧", "呢", "嘛", "哈", "呵", "哼",
+            "唔", "噢", "喂", "的", "了", "一", "是", "不", "好", "对", "是的", "嗯嗯", "啊啊",
+            "uh", "um", "ah", "oh", "eh", "hm", "hmm", "mm", "mmm", "mhm",
+            "yeah", "yea", "yep", "yes", "no", "the", "it", "is", "you", "so", "and", "or",
+            "but", "hey", "hi", "ok", "okay", "thankyou", "thanks",
+            "あ", "え", "お", "ん", "う", "はい", "ええ", "あの",
+            "어", "아", "음", "응", "네", "예",
+        )
     }
 }

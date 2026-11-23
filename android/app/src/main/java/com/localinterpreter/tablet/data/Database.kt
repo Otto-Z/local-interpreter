@@ -11,6 +11,11 @@ import kotlin.math.min
 class Database(context: Context) : SQLiteOpenHelper(context, "history.db", null, 1) {
     private val appContext = context.applicationContext
 
+    init {
+        // 启用 WAL 模式，让实时写入字幕/说话人/问答与课程页/助教检索并发读写不互相锁死。
+        runCatching { setWriteAheadLoggingEnabled(true) }
+    }
+
     fun recreate() {
         runCatching { close() }
         val dbFile = appContext.getDatabasePath("history.db")
@@ -297,13 +302,20 @@ class Database(context: Context) : SQLiteOpenHelper(context, "history.db", null,
     }
 
     fun endSession(id: Long, title: String, summary: String, status: String = "finished") {
-        val started = query("SELECT started_at FROM sessions WHERE id=?", arrayOf(id.toString())) {
-            it.getLong(0)
-        }.firstOrNull() ?: System.currentTimeMillis()
+        val meta = query("SELECT started_at, audio_source FROM sessions WHERE id=?", arrayOf(id.toString())) {
+            it.getLong(0) to (it.getString(1) ?: "mic")
+        }.firstOrNull()
+        val started = meta?.first ?: System.currentTimeMillis()
+        val source = meta?.second ?: "mic"
+        val lastSeg = query("SELECT MAX(t1) FROM segments WHERE session_id=?", arrayOf(id.toString())) {
+            if (it.isNull(0)) 0.0 else it.getDouble(0)
+        }.firstOrNull() ?: 0.0
         val now = System.currentTimeMillis()
+        val wallS = ((now - started) / 1000.0).coerceAtLeast(0.0)
+        val durationS = if (source == "file" && lastSeg > 0.0) lastSeg else max(wallS, lastSeg)
         writableDatabase.update("sessions", ContentValues().apply {
             put("ended_at", now)
-            put("duration_s", (now - started) / 1000.0)
+            put("duration_s", durationS)
             if (summary.isNotBlank()) put("summary", summary.trim())
             put("status", status)
         }, "id=?", arrayOf(id.toString()))
@@ -467,6 +479,10 @@ class Database(context: Context) : SQLiteOpenHelper(context, "history.db", null,
 
     fun updateSegmentSource(id: Long, text: String) {
         writableDatabase.update("segments", ContentValues().apply { put("src_text", text) }, "id=?", arrayOf(id.toString()))
+    }
+
+    fun updateSegmentAudioPath(id: Long, audioPath: String) {
+        writableDatabase.update("segments", ContentValues().apply { put("audio_path", audioPath) }, "id=?", arrayOf(id.toString()))
     }
 
     fun setSegmentSpeaker(id: Long, speakerId: Long?) {
@@ -816,14 +832,26 @@ class Database(context: Context) : SQLiteOpenHelper(context, "history.db", null,
         writableDatabase.delete("glossary", "id=?", arrayOf(id.toString()))
     }
 
-    fun glossaryPrompt(courseId: Long?, limit: Int = 30): String {
+    fun glossaryPrompt(courseId: Long?, limit: Int = 30, maxChars: Int = 480): String {
         if (courseId == null) return ""
-        return listGlossary(courseId).take(limit).joinToString("；") { "${it.term}→${it.translation}" }
+        val sb = StringBuilder()
+        for (item in listGlossary(courseId).take(limit)) {
+            val entry = "${item.term.take(40)}→${item.translation.take(60)}"
+            if (sb.isNotEmpty() && sb.length + 1 + entry.length > maxChars) break
+            if (sb.isNotEmpty()) sb.append('；')
+            sb.append(entry)
+        }
+        return sb.toString()
     }
 
     // -------------------------------------------------------------- bookmarks
 
     fun addBookmark(sessionId: Long, segmentId: Long) {
+        val exists = query(
+            "SELECT 1 FROM bookmarks WHERE session_id=? AND segment_id=? LIMIT 1",
+            arrayOf(sessionId.toString(), segmentId.toString()),
+        ) { it.getInt(0) }.isNotEmpty()
+        if (exists) return
         writableDatabase.insert("bookmarks", null, ContentValues().apply {
             put("session_id", sessionId)
             put("segment_id", segmentId)

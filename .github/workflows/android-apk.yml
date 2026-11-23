@@ -1,0 +1,118 @@
+name: Build Android Release APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - ".github/workflows/android-apk.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "android/**"
+      - ".github/workflows/android-apk.yml"
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "同时发布/更新 GitHub Release（附带 APK 下载链接）"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Android NDK 27.2.12479018 & CMake 3.31.5
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          yes | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;27.2.12479018" \
+            "cmake;3.31.5"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Read app version
+        id: ver
+        run: |
+          VERSION_NAME=$(grep -E 'versionName\s*=' android/app/build.gradle.kts | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          VERSION_CODE=$(grep -E 'versionCode\s*=' android/app/build.gradle.kts | head -n1 | sed -E 's/[^0-9]//g')
+          echo "name=${VERSION_NAME:-2.4.0}" >> "$GITHUB_OUTPUT"
+          echo "code=${VERSION_CODE:-18}" >> "$GITHUB_OUTPUT"
+
+      - name: Build signed Release APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon --console=plain
+
+      - name: Prepare & verify APK artifact
+        run: |
+          APK_SRC="android/app/build/outputs/apk/release/app-release.apk"
+          APK_OUT="local-interpreter-android-v${{ steps.ver.outputs.name }}-arm64.apk"
+          cp "$APK_SRC" "$APK_OUT"
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs "$APK_OUT"
+          ls -lh "$APK_OUT"
+          echo "APK_FILE=$APK_OUT" >> "$GITHUB_ENV"
+
+      - name: Upload APK as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-interpreter-android-v${{ steps.ver.outputs.name }}-arm64
+          path: ${{ env.APK_FILE }}
+          retention-days: 30
+
+      - name: Publish or update GitHub Release
+        if: |
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.ver.outputs.name }}-android"
+          TITLE="本地同传 Android v${{ steps.ver.outputs.name }} (build ${{ steps.ver.outputs.code }})"
+          NOTES=$(cat <<'EOF'
+          ## 本地同传 Android 平板版（arm64-v8a）
+
+          ### 下载与安装
+          - 在 Android 平板 / 手机浏览器中直接点击下方 **APK 文件** 下载安装即可。
+          - 使用项目统一签名密钥，支持直接覆盖升级旧版本，历史课次、模型与设置自动保留。
+
+          ### 版本亮点
+          - **极速离线推理**：7 档 ARM64 CPU 动态 SIMD 加速 + KV Prefix 缓存复用 + Flash Attention + 可选 Vulkan GPU 加速与 CPU 自动回退。
+          - **环境抗噪防误触**：硬件降噪 + 自适应底噪 + 5 层防幻觉过滤 + 3 档抗噪快切 + 2 秒环境测噪校准向导。
+          - **全新平板 UI 重构**：高对比度深/浅双色主题、三页签统一导航、开播前音源准备台、逐句卡片（标记/编辑重译/术语快加）、一键互换语言（⇄）、5 分类设置中心（实时字幕预览 + 可视化存储条）、全屏影院字幕与一键关闭浮字幕。
+          EOF
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK_FILE" --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES"
+          else
+            gh release create "$TAG" "$APK_FILE" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes "$NOTES"
+          fi

@@ -34,34 +34,36 @@ class LiveService : Service() {
     override fun onCreate() {
         super.onCreate()
         val nm = getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            nm.createNotificationChannel(
-                NotificationChannel(CHANNEL, "同传运行中", NotificationManager.IMPORTANCE_LOW).apply {
-                    setShowBadge(false)
-                }
-            )
-        }
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL, "同传运行中", NotificationManager.IMPORTANCE_LOW).apply {
+                setShowBadge(false)
+            }
+        )
         scope.launch {
             var lastActive: Boolean? = null
+            var lastStarting: Boolean? = null
             var lastPaused: Boolean? = null
             var lastSource: LiveSource? = null
             App.instance.live.state.collect { st ->
                 val active = st.running || st.starting
                 if (active) {
                     acquireWakeLock()
-                    if (lastActive != true || lastPaused != st.paused || lastSource != st.source) {
-                        updateNotification(st.paused, st.source)
+                    if (lastActive != true || lastStarting != st.starting || lastPaused != st.paused || lastSource != st.source) {
+                        updateNotification(st.paused, st.source, st.starting)
                     }
                     lastActive = true
+                    lastStarting = st.starting
                     lastPaused = st.paused
                     lastSource = st.source
                 } else if (lastActive != false) {
                     lastActive = false
+                    lastStarting = null
                     releaseWakeLock()
+                    projection = null
                     delay(400)
                     val now = App.instance.live.state.value
                     if (!now.running && !now.starting) {
-                        stopForegroundCompat()
+                        stopForeground(STOP_FOREGROUND_REMOVE)
                         stopSelf()
                     } else {
                         // 宽限期内又开始了新会话，继续复用前台服务。
@@ -81,13 +83,13 @@ class LiveService : Service() {
             ACTION_PAUSE -> {
                 if (App.instance.live.state.value.running) {
                     App.instance.live.pause()
-                    updateNotification(true, App.instance.live.state.value.source)
+                    updateNotification(true, App.instance.live.state.value.source, false)
                 }
             }
             ACTION_RESUME -> {
                 if (App.instance.live.state.value.running) {
                     App.instance.live.resume()
-                    updateNotification(false, App.instance.live.state.value.source)
+                    updateNotification(false, App.instance.live.state.value.source, false)
                 }
             }
             ACTION_STOP -> App.instance.live.stop()
@@ -111,13 +113,13 @@ class LiveService : Service() {
         }
     }
 
-    private fun enterForeground(source: LiveSource, paused: Boolean) {
+    private fun enterForeground(source: LiveSource, paused: Boolean, starting: Boolean) {
         val type = foregroundType(source)
-        AppLog.d("Service", "startForeground source=$source type=$type paused=$paused")
+        AppLog.d("Service", "startForeground source=$source type=$type paused=$paused starting=$starting")
         if (type != 0) {
-            startForeground(NOTIFICATION_ID, buildNotification(paused, source), type)
+            startForeground(NOTIFICATION_ID, buildNotification(paused, source, starting), type)
         } else {
-            startForeground(NOTIFICATION_ID, buildNotification(paused, source))
+            startForeground(NOTIFICATION_ID, buildNotification(paused, source, starting))
         }
         acquireWakeLock()
     }
@@ -156,7 +158,7 @@ class LiveService : Service() {
         if (current.running || current.starting) {
             // 已有会话在跑：只确保前台服务仍存在且类型/通知正确，不启动第二个会话。
             try {
-                enterForeground(current.source, current.paused)
+                enterForeground(current.source, current.paused, current.starting)
             } catch (t: Throwable) {
                 // 已有会话在跑时，更新通知失败不应把正在录音的服务停掉。
                 AppLog.e("Service", "更新前台通知失败", t)
@@ -165,7 +167,7 @@ class LiveService : Service() {
         }
         val courseId = intent.getLongExtra(EXTRA_COURSE_ID, -1L).takeIf { it > 0 }
         try {
-            enterForeground(source, false)
+            enterForeground(source, paused = false, starting = true)
         } catch (t: Throwable) {
             AppLog.e("LiveService", "前台服务启动失败 source=$source", t)
             App.instance.live.reportError(
@@ -173,6 +175,12 @@ class LiveService : Service() {
             )
             stopSelf()
             return
+        }
+
+        // 清理上一次系统音频会话残留的 MediaProjection，避免误传给麦克风/文件会话。
+        if (source != LiveSource.SYSTEM) {
+            runCatching { projection?.stop() }
+            projection = null
         }
 
         if (source == LiveSource.FILE) {
@@ -207,10 +215,10 @@ class LiveService : Service() {
                 return
             }
         }
-        App.instance.live.start(this, source, courseId, projection)
+        App.instance.live.start(this, source, courseId, if (source == LiveSource.SYSTEM) projection else null)
     }
 
-    private fun buildNotification(paused: Boolean, source: LiveSource): Notification {
+    private fun buildNotification(paused: Boolean, source: LiveSource, starting: Boolean): Notification {
         val open = PendingIntent.getActivity(
             this, 1,
             Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
@@ -222,37 +230,32 @@ class LiveService : Service() {
             PendingIntent.getService(this, 2, Intent(this, LiveService::class.java).setAction(ACTION_PAUSE), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         }
         val stop = PendingIntent.getService(this, 3, Intent(this, LiveService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        return NotificationCompat.Builder(this, CHANNEL)
+        val builder = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_live)
             .setContentTitle("本地同传 · ${source.label}")
             .setContentText(
-                if (paused) "已暂停" else when (source) {
-                    LiveSource.MIC -> "正在听麦克风，字幕持续更新"
-                    LiveSource.SYSTEM -> "正在听系统声音，字幕持续更新"
-                    LiveSource.FILE -> "正在全速转写音频文件，字幕持续更新"
+                when {
+                    starting -> "正在准备语音识别模型…"
+                    paused -> "已暂停"
+                    source == LiveSource.MIC -> "正在听麦克风，字幕持续更新"
+                    source == LiveSource.SYSTEM -> "正在听系统声音，字幕持续更新"
+                    else -> "正在全速转写音频文件，字幕持续更新"
                 }
             )
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .addAction(0, if (paused) "继续" else "暂停", toggle)
-            .addAction(0, "结束", stop)
-            .build()
-    }
-
-    private fun updateNotification(paused: Boolean, source: LiveSource) {
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.notify(NOTIFICATION_ID, buildNotification(paused, source))
-    }
-
-    private fun stopForegroundCompat() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-        } else {
-            @Suppress("DEPRECATION")
-            stopForeground(true)
+        if (!starting) {
+            builder.addAction(0, if (paused) "继续" else "暂停", toggle)
         }
+        builder.addAction(0, if (starting) "取消" else "结束", stop)
+        return builder.build()
+    }
+
+    private fun updateNotification(paused: Boolean, source: LiveSource, starting: Boolean) {
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.notify(NOTIFICATION_ID, buildNotification(paused, source, starting))
     }
 
     override fun onDestroy() {

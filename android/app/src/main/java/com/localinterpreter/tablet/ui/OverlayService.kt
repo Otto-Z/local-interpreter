@@ -8,8 +8,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.IBinder
@@ -23,18 +25,18 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.localinterpreter.tablet.App
-import com.localinterpreter.tablet.live.LiveState
 import com.localinterpreter.tablet.MainActivity
 import com.localinterpreter.tablet.R
 import com.localinterpreter.tablet.data.SettingsData
+import com.localinterpreter.tablet.live.LiveState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
@@ -45,10 +47,19 @@ class OverlayService : Service() {
     private var wm: WindowManager? = null
     private var view: View? = null
     private var params: WindowManager.LayoutParams? = null
+    private var statusDot: View? = null
+    private var statusText: TextView? = null
     private var mainText: TextView? = null
     private var subText: TextView? = null
     private var currentSettings: SettingsData? = null
     private var background: GradientDrawable? = null
+
+    private class OverlayContainer(context: Context) : LinearLayout(context) {
+        override fun performClick(): Boolean {
+            super.performClick()
+            return true
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -67,8 +78,8 @@ class OverlayService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            running.set(false)
-            stopForeground(true)
+            setRunning(false)
+            stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
         }
@@ -76,13 +87,28 @@ class OverlayService : Service() {
             startForegroundCompat()
         } catch (t: Throwable) {
             errors.value = "浮字幕启动失败：${t.message?.take(80) ?: "系统限制"}"
-            running.set(false)
+            setRunning(false)
             stopSelf()
             return START_NOT_STICKY
         }
         if (view == null) addOverlay() else view?.visibility = View.VISIBLE
-        running.set(true)
+        if (view != null) setRunning(true)
         return START_STICKY
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        val v = view ?: return
+        val lp = params ?: return
+        val metrics = resources.displayMetrics
+        val density = metrics.density
+        val newWidth = (metrics.widthPixels - (48 * density).toInt()).coerceAtLeast((240 * density).toInt())
+        lp.width = newWidth
+        val maxX = (metrics.widthPixels - newWidth).coerceAtLeast(0)
+        val maxY = (metrics.heightPixels - v.height.coerceAtLeast((80 * density).toInt())).coerceAtLeast(0)
+        lp.x = lp.x.coerceIn(0, maxX)
+        lp.y = lp.y.coerceIn(0, maxY)
+        runCatching { wm?.updateViewLayout(v, lp) }
     }
 
     private fun startForegroundCompat() {
@@ -99,7 +125,7 @@ class OverlayService : Service() {
         val notif: Notification = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_live)
             .setContentTitle("浮字幕已开启")
-            .setContentText("字幕浮在所有应用上方，可拖动。")
+            .setContentText("字幕浮在所有应用上方，可拖动或点击右上角关闭。")
             .setContentIntent(open)
             .setOngoing(true)
             .addAction(0, "关闭浮字幕", stop)
@@ -115,7 +141,7 @@ class OverlayService : Service() {
     private fun addOverlay() {
         if (!Settings.canDrawOverlays(this)) {
             errors.value = "没有「显示在其他应用上层」权限，浮字幕无法显示"
-            running.set(false)
+            setRunning(false)
             stopSelf()
             return
         }
@@ -124,14 +150,14 @@ class OverlayService : Service() {
         val width = (screenWidth - (48 * density).toInt()).coerceAtLeast((240 * density).toInt())
         val settings = App.instance.settings.value
 
-        val container = LinearLayout(this).apply {
+        val container = OverlayContainer(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding((20 * density).toInt(), (14 * density).toInt(), (20 * density).toInt(), (14 * density).toInt())
+            setPadding((18 * density).toInt(), (10 * density).toInt(), (18 * density).toInt(), (14 * density).toInt())
             val bg = GradientDrawable().apply {
-                cornerRadius = 16 * density
+                cornerRadius = 18 * density
                 val alpha = (settings.overlayOpacity.coerceIn(0.2f, 1f) * 255).toInt()
-                setColor(Color.argb(alpha, 0x0B, 0x0D, 0x10))
-                setStroke((1 * density).toInt(), Color.parseColor("#334FD1A5"))
+                setColor(Color.argb(alpha, 0x0B, 0x0E, 0x13))
+                setStroke((1 * density).toInt(), Color.parseColor("#443FE0B0"))
             }
             this@OverlayService.background = bg
             background = bg
@@ -142,21 +168,65 @@ class OverlayService : Service() {
                 )
             }
         }
-        val main = TextView(this).apply {
-            setTextColor(Color.parseColor("#F2F4F7"))
-            textSize = (settings.subtitleSize * 0.72f).coerceIn(15f, 34f)
-            maxLines = 3
-            ellipsize = TextUtils.TruncateAt.END
-            setLineSpacing(0f, 1.15f)
+
+        // 顶部状态与快捷关闭栏
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, (6 * density).toInt())
         }
+        val dot = View(this).apply {
+            val size = (7 * density).toInt()
+            layoutParams = LinearLayout.LayoutParams(size, size).apply {
+                marginEnd = (7 * density).toInt()
+            }
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#3FE0B0"))
+            }
+        }
+        val status = TextView(this).apply {
+            text = "本地同传"
+            setTextColor(Color.parseColor("#8E99AA"))
+            textSize = 11f
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val closeBtn = TextView(this).apply {
+            text = "✕"
+            setTextColor(Color.parseColor("#9AA5B6"))
+            textSize = 13f
+            setPadding((10 * density).toInt(), (2 * density).toInt(), (4 * density).toInt(), (2 * density).toInt())
+            setOnClickListener {
+                setRunning(false)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }
+        header.addView(dot)
+        header.addView(status)
+        header.addView(closeBtn)
+        statusDot = dot
+        statusText = status
+
+        // 原文在上方、译文在下方，与主界面及全屏字幕阅读顺序保持一致
         val sub = TextView(this).apply {
-            setTextColor(Color.parseColor("#8A939F"))
+            setTextColor(Color.parseColor("#98A4B5"))
             textSize = (settings.subtitleSize * 0.42f).coerceIn(10f, 18f)
             maxLines = 2
             ellipsize = TextUtils.TruncateAt.END
+            setPadding(0, 0, 0, (4 * density).toInt())
         }
-        container.addView(main)
+        val main = TextView(this).apply {
+            setTextColor(Color.parseColor("#F5F7FA"))
+            textSize = (settings.subtitleSize * 0.72f).coerceIn(15f, 34f)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            maxLines = 3
+            ellipsize = TextUtils.TruncateAt.END
+            setLineSpacing(0f, 1.18f)
+        }
+        container.addView(header)
         container.addView(sub)
+        container.addView(main)
         mainText = main
         subText = sub
 
@@ -212,7 +282,7 @@ class OverlayService : Service() {
             render(App.instance.live.state.value)
         } catch (t: Throwable) {
             errors.value = "浮字幕无法显示：${t.message?.take(80) ?: "请重新开启"}"
-            running.set(false)
+            setRunning(false)
             runCatching { wm?.removeView(container) }
             stopSelf()
         }
@@ -225,8 +295,8 @@ class OverlayService : Service() {
         subText?.textSize = (s.subtitleSize * 0.42f).coerceIn(10f, 18f)
         background?.let { bg ->
             val alpha = (s.overlayOpacity.coerceIn(0.2f, 1f) * 255).toInt()
-            bg.setColor(Color.argb(alpha, 0x0B, 0x0D, 0x10))
-            bg.setStroke((1 * density).toInt(), Color.parseColor("#334FD1A5"))
+            bg.setColor(Color.argb(alpha, 0x0B, 0x0E, 0x13))
+            bg.setStroke((1 * density).toInt(), Color.parseColor("#443FE0B0"))
         }
         view?.background = background
         render(App.instance.live.state.value)
@@ -237,34 +307,50 @@ class OverlayService : Service() {
         val lineCount = settings.subtitleLines.coerceIn(1, 4)
         val recent = st.segments.takeLast(lineCount)
         val targets = recent.mapNotNull { it.tgt.ifBlank { it.src }.ifBlank { null } }
-        val sources = recent.mapNotNull { it.src.ifBlank { null } }
         val partial = st.partialTgt.ifBlank { st.partialSrc }
         val main = buildList {
             addAll(targets)
             if (partial.isNotBlank()) add(partial)
         }.takeLast(lineCount).joinToString("\n")
+
+        statusText?.text = when {
+            st.running && st.paused -> "已暂停 · 拖动可移位"
+            st.running -> "同传中 · 轻触返回应用"
+            else -> "本地同传 · 等待开始"
+        }
+        (statusDot?.background as? GradientDrawable)?.setColor(
+            when {
+                st.running && !st.paused -> Color.parseColor("#3FE0B0")
+                st.running && st.paused -> Color.parseColor("#F0B856")
+                else -> Color.parseColor("#7D8898")
+            }
+        )
+
         mainText?.maxLines = lineCount + 1
         mainText?.text = main.ifBlank {
-            if (st.running) "正在听…" else "本地同传 · 等待开始"
+            if (st.running) "正在聆听…" else "点击主界面「开始同传」即可显示实时字幕"
         }
-        subText?.text = if (settings.showSource) sources.takeLast(1).joinToString("\n") else ""
+        val latestSrc = when {
+            st.partialTgt.isNotBlank() && st.partialSrc.isNotBlank() -> st.partialSrc
+            st.partialSrc.isNotBlank() -> ""
+            else -> recent.lastOrNull()?.let { if (it.tgt.isNotBlank()) it.src else "" }.orEmpty()
+        }
+        subText?.text = if (settings.showSource) latestSrc else ""
         subText?.visibility = if (subText?.text.isNullOrBlank()) View.GONE else View.VISIBLE
     }
 
     private fun createChannel() {
         val nm = getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            nm.createNotificationChannel(
-                NotificationChannel(CHANNEL, "浮字幕", NotificationManager.IMPORTANCE_LOW).apply {
-                    setShowBadge(false)
-                }
-            )
-        }
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL, "浮字幕", NotificationManager.IMPORTANCE_LOW).apply {
+                setShowBadge(false)
+            }
+        )
     }
 
     override fun onDestroy() {
-        running.set(false)
-        runCatching { stopForeground(true) }
+        setRunning(false)
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
         view?.let { runCatching { wm?.removeView(it) } }
         view = null
         scope.cancel()
@@ -278,8 +364,15 @@ class OverlayService : Service() {
         const val ID = 43
         const val ACTION_STOP = "stop_overlay"
         val running = AtomicBoolean(false)
+        private val _isRunning = MutableStateFlow(false)
+        val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
         /** 启动失败原因，主界面收集后提示用户。 */
         val errors = MutableStateFlow<String?>(null)
+
+        private fun setRunning(value: Boolean) {
+            running.set(value)
+            _isRunning.value = value
+        }
 
         fun start(context: Context) {
             ContextCompat.startForegroundService(

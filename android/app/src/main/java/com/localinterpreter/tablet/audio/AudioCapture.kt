@@ -9,6 +9,7 @@ import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.NoiseSuppressor
 import android.media.projection.MediaProjection
 import android.os.Build
 import android.os.Handler
@@ -24,6 +25,70 @@ interface AudioCapture {
     fun start()
     fun stop()
     val label: String
+}
+
+/**
+ * 连续流式重采样器：跨 read() 缓冲区保持相位和余数样本，消除 48k→16k 每帧丢 2 样本产生的
+ * 周期性咔嗒声与混叠噪声。48k→16k（整 3 倍）使用 3 点盒式均值抗混叠降采样，既更清晰又更快。
+ */
+internal class StreamResampler(private val from: Int, private val to: Int) {
+    private val exactRatio = if (from > to && from % to == 0) from / to else 0
+    private var accSum = 0.0
+    private var accCount = 0
+    private var hasPrev = false
+    private var prevSample = 0f
+    private var phase = 0.0
+
+    fun process(src: ShortArray, n: Int): FloatArray {
+        if (n <= 0 || from <= 0 || to <= 0) return FloatArray(0)
+        if (from == to) return FloatArray(n) { src[it] / 32768f }
+        if (exactRatio > 1) {
+            val total = accCount + n
+            val outLen = total / exactRatio
+            val out = FloatArray(outLen)
+            var outIdx = 0
+            var sum = accSum
+            var cnt = accCount
+            val invScale = 1.0 / (exactRatio * 32768.0)
+            for (i in 0 until n) {
+                sum += src[i].toDouble()
+                cnt++
+                if (cnt == exactRatio) {
+                    out[outIdx++] = (sum * invScale).toFloat()
+                    sum = 0.0
+                    cnt = 0
+                }
+            }
+            accSum = sum
+            accCount = cnt
+            return out
+        }
+        val step = from.toDouble() / to.toDouble()
+        val estOut = ((n / step) + 4).toInt().coerceAtLeast(1)
+        val out = FloatArray(estOut)
+        var outIdx = 0
+        var pos = phase
+        while (pos < n) {
+            val sample = if (pos < 0.0) {
+                val frac = pos + 1.0
+                val s0 = if (hasPrev) prevSample else src[0] / 32768f
+                val s1 = src[0] / 32768f
+                (s0 * (1.0 - frac) + s1 * frac).toFloat()
+            } else {
+                val idx = pos.toInt()
+                val next = idx + 1
+                if (next >= n) break
+                val frac = pos - idx
+                ((src[idx] * (1.0 - frac) + src[next] * frac) / 32768.0).toFloat()
+            }
+            if (outIdx < out.size) out[outIdx++] = sample
+            pos += step
+        }
+        prevSample = src[n - 1] / 32768f
+        hasPrev = true
+        phase = pos - n
+        return if (outIdx == out.size) out else out.copyOf(outIdx)
+    }
 }
 
 class MicCapture(
@@ -100,20 +165,32 @@ class MicCapture(
             throw RuntimeException("麦克风初始化失败，请检查录音权限")
         }
         val actualRate = if (rec.sampleRate > 0) rec.sampleRate else rate
+        // 优先启用系统 DSP 硬件降噪（零 CPU 占用），显著压制空调/风扇/轻微环境底噪，
+        // 防止无人说话时杂音触发 VAD 或诱导 SenseVoice 产生乱码幻觉。
+        val suppressor = runCatching {
+            if (NoiseSuppressor.isAvailable()) {
+                NoiseSuppressor.create(rec.audioSessionId)?.apply { enabled = true }
+            } else null
+        }.getOrNull()
         record = rec
         running = true
-        AppLog.d("Audio", "麦克风采集开始 source=$source rate=$actualRate buffer=$bufSize")
+        AppLog.d(
+            "Audio",
+            "麦克风采集开始 source=$source rate=$actualRate buffer=$bufSize ns=${suppressor?.enabled == true}",
+        )
         try {
             rec.startRecording()
         } catch (t: Throwable) {
             running = false
             record = null
+            runCatching { suppressor?.release() }
             runCatching { rec.release() }
             throw RuntimeException("麦克风启动失败：${t.message ?: "请检查录音权限"}", t)
         }
         if (rec.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
             running = false
             record = null
+            runCatching { suppressor?.release() }
             runCatching { rec.release() }
             throw RuntimeException("麦克风没有进入录音状态：可能被系统隐私开关或其它应用阻止")
         }
@@ -124,6 +201,7 @@ class MicCapture(
         )
         thread = thread(name = "mic-capture", isDaemon = true) {
             val shorts = ShortArray(2048)
+            val resampler = StreamResampler(actualRate, targetRate)
             try {
                 while (running) {
                     val n = try {
@@ -134,11 +212,7 @@ class MicCapture(
                         break
                     }
                     if (n > 0) {
-                        val out = if (actualRate == targetRate) {
-                            FloatArray(n) { shorts[it] / 32768f }
-                        } else {
-                            resample(shorts, n, actualRate, targetRate)
-                        }
+                        val out = resampler.process(shorts, n)
                         if (out.isNotEmpty()) {
                             try {
                                 onFrames(out)
@@ -155,25 +229,11 @@ class MicCapture(
             } finally {
                 // 采集线程退出后自己释放，保证不会出现「还在 read，对象已被 stop() 释放」。
                 synchronized(releaseLock) {
+                    runCatching { suppressor?.release() }
                     runCatching { rec.release() }
                 }
             }
         }
-    }
-
-    private fun resample(src: ShortArray, n: Int, from: Int, to: Int): FloatArray {
-        if (n <= 0 || from <= 0 || to <= 0) return FloatArray(0)
-        if (from == to) return FloatArray(n) { src[it] / 32768f }
-        val outLen = (n.toLong() * to / from).toInt().coerceAtLeast(1)
-        val out = FloatArray(outLen)
-        for (i in 0 until outLen) {
-            val pos = i.toDouble() * from / to
-            val idx = pos.toInt().coerceIn(0, n - 1)
-            val next = (idx + 1).coerceAtMost(n - 1)
-            val frac = pos - idx
-            out[i] = (src[idx] * (1 - frac) + src[next] * frac).toFloat() / 32768f
-        }
-        return out
     }
 
     override fun stop() {
@@ -214,9 +274,6 @@ class SystemAudioCapture(
 
     @SuppressLint("MissingPermission")
     override fun start() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            throw RuntimeException("系统音频采集需要 Android 10 及以上")
-        }
         if (running) return
         val config = AudioPlaybackCaptureConfiguration.Builder(projection)
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
@@ -270,6 +327,7 @@ class SystemAudioCapture(
         thread = thread(name = "system-audio-capture", isDaemon = true) {
             AppLog.d("Audio", "系统音频采集开始 capture=$captureRate actual=$actualRate buf=$bufSize")
             val shorts = ShortArray(2048)
+            val resampler = StreamResampler(actualRate, targetRate)
             try {
                 while (running) {
                     val n = try {
@@ -279,11 +337,14 @@ class SystemAudioCapture(
                         break
                     }
                     if (n > 0) {
-                        try {
-                            onFrames(resample(shorts, n, actualRate, targetRate))
-                        } catch (t: Throwable) {
-                            if (running) onError("系统音频处理失败：${t.message ?: "未知错误"}")
-                            break
+                        val out = resampler.process(shorts, n)
+                        if (out.isNotEmpty()) {
+                            try {
+                                onFrames(out)
+                            } catch (t: Throwable) {
+                                if (running) onError("系统音频处理失败：${t.message ?: "未知错误"}")
+                                break
+                            }
                         }
                     } else if (n < 0) {
                         if (running) onError("系统音频读取失败（错误码 $n），请重新开始并确认录屏授权")
@@ -297,21 +358,6 @@ class SystemAudioCapture(
                 }
             }
         }
-    }
-
-    private fun resample(src: ShortArray, n: Int, from: Int, to: Int): FloatArray {
-        if (from == to) return FloatArray(n) { src[it] / 32768f }
-        if (from <= 0 || to <= 0) return FloatArray(0)
-        val outLen = (n.toLong() * to / from).toInt().coerceAtLeast(1)
-        val out = FloatArray(outLen)
-        for (i in 0 until outLen) {
-            val pos = i.toDouble() * from / to
-            val idx = pos.toInt().coerceIn(0, n - 1)
-            val next = (idx + 1).coerceAtMost(n - 1)
-            val frac = pos - idx
-            out[i] = (src[idx] * (1 - frac) + src[next] * frac).toFloat() / 32768f
-        }
-        return out
     }
 
     override fun stop() {
@@ -404,5 +450,101 @@ object WavUtil {
             }
             raf.write(buf)
         }
+    }
+}
+
+data class NoiseCalibrationResult(
+    val ambientRms: Float,
+    val p90Rms: Float,
+    val dbfs: Int,
+    val recommendedMode: String,
+    val windowCount: Int,
+)
+
+/**
+ * 2 秒环境噪声校准：直接复用 MicCapture（含系统硬件 NoiseSuppressor 与重采样）采样当前环境底噪，
+ * 剔除前 250ms 点击杂音及瞬时毛刺后计算稳态底噪基线，并给出最匹配的抗噪档位推荐。
+ */
+object NoiseCalibrator {
+    suspend fun measure(
+        context: Context,
+        durationMs: Long = 2000L,
+        onProgress: (Float) -> Unit = {},
+    ): NoiseCalibrationResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val perm = androidx.core.content.ContextCompat.checkSelfPermission(
+            context,
+            android.Manifest.permission.RECORD_AUDIO,
+        )
+        if (perm != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            throw RuntimeException("尚未授予麦克风权限，请先允许录音权限后再校准")
+        }
+        val frameRms = java.util.Collections.synchronizedList(mutableListOf<Float>())
+        val captureError = java.util.concurrent.atomic.AtomicReference<String?>(null)
+        val startedAt = android.os.SystemClock.elapsedRealtime()
+        val windowSize = 512
+        val acc = FloatArray(windowSize)
+        var filled = 0
+
+        val cap = MicCapture(
+            context = context,
+            onFrames = { frames ->
+                // 跳过前 250ms，避免用户手指点击校准按钮的敲击声污染底噪统计。
+                if (android.os.SystemClock.elapsedRealtime() - startedAt < 250L) return@MicCapture
+                var off = 0
+                while (off < frames.size) {
+                    val take = minOf(windowSize - filled, frames.size - off)
+                    System.arraycopy(frames, off, acc, filled, take)
+                    filled += take
+                    off += take
+                    if (filled == windowSize) {
+                        var sum = 0.0
+                        for (v in acc) sum += v.toDouble() * v
+                        frameRms.add(kotlin.math.sqrt(sum / windowSize).toFloat())
+                        filled = 0
+                    }
+                }
+            },
+            onError = { msg -> captureError.compareAndSet(null, msg) },
+        )
+        cap.start()
+        try {
+            val total = durationMs.coerceIn(1000L, 4000L)
+            while (true) {
+                val elapsed = android.os.SystemClock.elapsedRealtime() - startedAt
+                if (elapsed >= total || captureError.get() != null) break
+                onProgress((elapsed.toFloat() / total).coerceIn(0f, 1f))
+                kotlinx.coroutines.delay(80L)
+            }
+            onProgress(1f)
+        } finally {
+            runCatching { cap.stop() }
+        }
+        captureError.get()?.let { throw RuntimeException(it) }
+        val sorted = synchronized(frameRms) { frameRms.toList() }.sorted()
+        if (sorted.size < 8) {
+            throw RuntimeException("没有采到有效音频数据，请检查麦克风是否被静音或被其它应用占用")
+        }
+        // 取中位数作为稳态环境底噪，90% 分位用于识别高波动杂音环境。
+        val median = sorted[sorted.size / 2]
+        val p90 = sorted[((sorted.size - 1) * 0.90f).toInt()]
+        val floor = median.coerceIn(0.0010f, 0.025f)
+        val dbfs = (20.0 * kotlin.math.log10(floor.toDouble().coerceAtLeast(1e-6))).toInt()
+        val mode = when {
+            floor < 0.0022f && p90 < 0.0045f -> com.localinterpreter.tablet.data.SettingsData.NOISE_SENSITIVE
+            floor > 0.0065f || p90 > 0.013f -> com.localinterpreter.tablet.data.SettingsData.NOISE_STRICT
+            else -> com.localinterpreter.tablet.data.SettingsData.NOISE_STANDARD
+        }
+        AppLog.d(
+            "Audio",
+            "环境测噪校准完成 windows=${sorted.size} median=${"%.4f".format(median)} " +
+                "p90=${"%.4f".format(p90)} dbfs=$dbfs recommended=$mode",
+        )
+        NoiseCalibrationResult(
+            ambientRms = floor,
+            p90Rms = p90,
+            dbfs = dbfs,
+            recommendedMode = mode,
+            windowCount = sorted.size,
+        )
     }
 }

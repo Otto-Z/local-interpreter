@@ -13,14 +13,27 @@ android {
         applicationId = "com.localinterpreter.tablet"
         minSdk = 29
         targetSdk = 34
-        versionCode = 17
-        versionName = "2.3.0"
+        versionCode = 18
+        versionName = "2.4.0"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
         externalNativeBuild {
             cmake {
-                arguments += listOf("-DANDROID_STL=c++_shared")
+                val enableVulkan = (project.findProperty("enableVulkan")?.toString()?.toBoolean() == true)
+                arguments += listOf(
+                    "-DANDROID_STL=c++_shared",
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-DBUILD_SHARED_LIBS=ON",
+                    "-DGGML_NATIVE=OFF",
+                    "-DGGML_BACKEND_DL=ON",
+                    "-DGGML_CPU_ALL_VARIANTS=ON",
+                    "-DGGML_LLAMAFILE=OFF",
+                    "-DLLAMA_OPENSSL=OFF",
+                )
+                if (enableVulkan) {
+                    arguments += "-DLOCAL_ENABLE_VULKAN=ON"
+                }
                 cppFlags += "-O3"
             }
         }
@@ -39,7 +52,9 @@ android {
 
     packaging {
         jniLibs {
-            useLegacyPackaging = false
+            // 必须解压 .so 到 nativeLibraryDir，供 llama.cpp 的 ggml_backend_load_all_from_path
+            // 在运行期按当前设备 CPU 特性自动加载最快的 dotprod/fp16/i8mm/sve2 后端。
+            useLegacyPackaging = true
         }
     }
 

@@ -4,7 +4,7 @@ package com.localinterpreter.tablet.llm
  * Thin JNI bridge to llama.cpp. Each instance owns one model + KV cache.
  * Calls are serialized inside the native layer; [cancel] is safe from another thread.
  */
-class LlamaNative private constructor(private var handle: Long) {
+class LlamaNative private constructor(@Volatile private var handle: Long) {
 
     @Volatile private var closed = false
 
@@ -54,8 +54,22 @@ class LlamaNative private constructor(private var handle: Long) {
             backendReady = true
         }
 
-        fun load(modelPath: String, contextSize: Int, threads: Int): LlamaNative? {
-            val h = create(modelPath, contextSize, threads)
+        fun hasGpuBackend(nativeLibDir: String): Boolean {
+            return runCatching {
+                ensureBackend(nativeLibDir)
+                nativeHasGpuBackend()
+            }.getOrDefault(false)
+        }
+
+        fun backendSummary(nativeLibDir: String): String {
+            return runCatching {
+                ensureBackend(nativeLibDir)
+                nativeBackendSummary()
+            }.getOrDefault("CPU")
+        }
+
+        fun load(modelPath: String, contextSize: Int, threads: Int, gpuLayers: Int = 0): LlamaNative? {
+            val h = create(modelPath, contextSize, threads, gpuLayers)
             return if (h == 0L) null else LlamaNative(h)
         }
 
@@ -63,7 +77,13 @@ class LlamaNative private constructor(private var handle: Long) {
         private external fun init(nativeLibDir: String)
 
         @JvmStatic
-        private external fun create(modelPath: String, nCtx: Int, nThreads: Int): Long
+        private external fun nativeHasGpuBackend(): Boolean
+
+        @JvmStatic
+        private external fun nativeBackendSummary(): String
+
+        @JvmStatic
+        private external fun create(modelPath: String, nCtx: Int, nThreads: Int, nGpuLayers: Int): Long
 
         @JvmStatic
         private external fun generate(

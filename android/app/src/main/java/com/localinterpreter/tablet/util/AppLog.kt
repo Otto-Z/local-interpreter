@@ -154,10 +154,21 @@ object AppLog {
         }
     }
 
+    private var writeCount = 0
+
     private fun write(level: String, tag: String, msg: String) {
         val f = file ?: return
         synchronized(lock) {
             try {
+                writeCount++
+                if (writeCount >= 256) {
+                    writeCount = 0
+                    if (f.length() > 4_000_000L) {
+                        val old = File(f.parentFile, "app.old.log")
+                        runCatching { old.delete() }
+                        runCatching { f.renameTo(old) }
+                    }
+                }
                 f.appendText("${timeFormat.format(Date())} $level/$tag $msg\n")
             } catch (_: Exception) {
             }

@@ -9,6 +9,7 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Handler
 import android.os.Looper
+import androidx.core.content.ContextCompat
 import com.localinterpreter.tablet.util.AppLog
 
 /**
@@ -23,6 +24,7 @@ class AudioRouteMonitor(context: Context, private val onChange: (String) -> Unit
     private val audioManager = appContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val handler = Handler(Looper.getMainLooper())
     private var registered = false
+    private var pendingNotify: Runnable? = null
 
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
@@ -38,9 +40,19 @@ class AudioRouteMonitor(context: Context, private val onChange: (String) -> Unit
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) {
                 AppLog.d("AudioRoute", "ACTION_AUDIO_BECOMING_NOISY")
-                onChange("noisy")
+                scheduleNotify("noisy", 150)
             }
         }
+    }
+
+    private fun scheduleNotify(reason: String, delayMs: Long) {
+        pendingNotify?.let { handler.removeCallbacks(it) }
+        val r = Runnable {
+            pendingNotify = null
+            if (registered) onChange(reason)
+        }
+        pendingNotify = r
+        handler.postDelayed(r, delayMs)
     }
 
     private fun report(kind: String, devices: Array<out AudioDeviceInfo>) {
@@ -49,11 +61,12 @@ class AudioRouteMonitor(context: Context, private val onChange: (String) -> Unit
             it.isSource && (it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
                 it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
                 it.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+                it.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
                 it.type == leaHeadset)
         } ?: return
         AppLog.d("AudioRoute", "$kind device=${mic.productName} type=${mic.type}")
-        // 新设备刚接入时输入路由可能还没生效，稍等再让上层重建采集。
-        handler.postDelayed({ onChange(kind) }, 400)
+        // 新设备刚接入时输入路由可能还没生效，防抖并稍等再让上层重建采集。
+        scheduleNotify(kind, 400)
     }
 
     fun start() {
@@ -62,13 +75,15 @@ class AudioRouteMonitor(context: Context, private val onChange: (String) -> Unit
         runCatching { audioManager.registerAudioDeviceCallback(deviceCallback, handler) }
         runCatching {
             val filter = IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
-            appContext.registerReceiver(noisyReceiver, filter)
+            ContextCompat.registerReceiver(appContext, noisyReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         }
     }
 
     fun stop() {
         if (!registered) return
         registered = false
+        pendingNotify?.let { handler.removeCallbacks(it) }
+        pendingNotify = null
         handler.removeCallbacksAndMessages(null)
         runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
         runCatching { appContext.unregisterReceiver(noisyReceiver) }

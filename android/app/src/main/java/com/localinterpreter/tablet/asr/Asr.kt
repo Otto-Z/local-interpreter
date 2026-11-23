@@ -17,6 +17,17 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
+
+data class AsrResult(
+    val text: String,
+    val lang: String,
+    val event: String = "",
+) {
+    companion object {
+        val EMPTY = AsrResult("", "", "")
+    }
+}
 
 class AsrEngine {
     private val _status = MutableStateFlow("语音模型未加载")
@@ -27,6 +38,8 @@ class AsrEngine {
     @Volatile private var loadedThreads: Int = 0
     @Volatile private var loading = false
     private val lock = Any()
+    /** 正在等待或执行最终识别的任务数：存在时预览识别立即让路，避免拖慢最终字幕。 */
+    private val finalWaiting = AtomicInteger(0)
 
     suspend fun ensureLoaded(language: String): Boolean = withContext(Dispatchers.IO) {
         val app = App.instance
@@ -63,6 +76,14 @@ class AsrEngine {
         AppLog.d("ASR", "开始加载 SenseVoice lang=$lang threads=$threads ${AppLog.memory()}")
         try {
             _status.value = "识别模型加载中…"
+            // 先释放旧实例再加载新模型，避免切换语言/线程时内存瞬时翻倍（~480MB）。
+            synchronized(lock) {
+                val old = recognizer
+                recognizer = null
+                loadedLanguage = ""
+                loadedThreads = 0
+                runCatching { old?.release() }
+            }
             val config = OfflineRecognizerConfig(
                 modelConfig = OfflineModelConfig(
                     senseVoice = OfflineSenseVoiceModelConfig(
@@ -77,13 +98,10 @@ class AsrEngine {
                 )
             )
             val rec = OfflineRecognizer(null, config)
-            // 替换与释放都在锁内：transcribe 在锁内取 recognizer 并完成 decode，不会用到已释放的对象。
             synchronized(lock) {
-                val old = recognizer
                 recognizer = rec
                 loadedLanguage = lang
                 loadedThreads = threads
-                runCatching { old?.release() }
             }
             _status.value = "SenseVoice 就绪"
             AppLog.d("ASR", "加载成功 ${System.currentTimeMillis() - started}ms")
@@ -97,24 +115,45 @@ class AsrEngine {
         }
     }
 
-    suspend fun transcribe(samples: FloatArray, language: String): Pair<String, String> =
-        withContext(Dispatchers.IO) {
-            if (!ensureLoaded(language)) return@withContext "" to ""
+    suspend fun transcribe(samples: FloatArray, language: String): Pair<String, String> {
+        val res = transcribeDetailed(samples, language, isPartial = false)
+        return res.text to res.lang
+    }
+
+    suspend fun transcribeDetailed(
+        samples: FloatArray,
+        language: String,
+        isPartial: Boolean = false,
+    ): AsrResult = withContext(Dispatchers.IO) {
+        if (samples.isEmpty()) return@withContext AsrResult.EMPTY
+        if (isPartial && finalWaiting.get() > 0) return@withContext AsrResult.EMPTY
+        if (!ensureLoaded(language)) return@withContext AsrResult.EMPTY
+        if (!isPartial) finalWaiting.incrementAndGet()
+        try {
             synchronized(lock) {
-                val rec = recognizer ?: return@withContext "" to ""
+                if (isPartial && finalWaiting.get() > 0) return@withContext AsrResult.EMPTY
+                val rec = recognizer ?: return@withContext AsrResult.EMPTY
                 val stream = rec.createStream()
                 try {
                     stream.acceptWaveform(samples, 16000)
                     rec.decode(stream)
                     val result = rec.getResult(stream)
-                    val text = result.text.trim()
+                    val cleanText = SPECIAL_TAG_REGEX.replace(result.text, "").trim()
                     val rawLang = result.lang.trim('<', '|', '>', ' ')
-                    text to (rawLang.ifBlank { if (language != "auto") language else "" })
+                    val rawEvent = result.event.trim('<', '|', '>', ' ')
+                    AsrResult(
+                        text = cleanText,
+                        lang = rawLang.ifBlank { if (language != "auto") language else "" },
+                        event = rawEvent,
+                    )
                 } finally {
                     stream.release()
                 }
             }
+        } finally {
+            if (!isPartial) finalWaiting.decrementAndGet()
         }
+    }
 
     fun release() {
         synchronized(lock) {
@@ -125,11 +164,20 @@ class AsrEngine {
         }
         _status.value = "语音模型未加载"
     }
+
+    companion object {
+        private val SPECIAL_TAG_REGEX = Regex("<\\|[^|<>]*\\|>")
+    }
 }
 
 data class VadChunk(val startSamples: Long, val samples: FloatArray)
 
-class VadSegmenter(pauseMs: Int, maxSpeech: Float = 14f) {
+class VadSegmenter(
+    pauseMs: Int,
+    maxSpeech: Float = 14f,
+    threshold: Float = 0.45f,
+    minSpeech: Float = 0.28f,
+) {
     val vad: Vad
     val windowSize: Int
     private val config: VadModelConfig
@@ -140,10 +188,10 @@ class VadSegmenter(pauseMs: Int, maxSpeech: Float = 14f) {
         config = VadModelConfig(
             sileroVadModelConfig = SileroVadModelConfig(
                 model = model.absolutePath,
-                // 教室远场/笔记本外放的音量偏低，0.5 容易整段检测不到；0.4 更稳。
-                threshold = 0.35f,
+                // 麦克风默认 0.45 / 0.28s 兼顾远场人声与环境杂音抑制；数字内录/文件可传更低阈值。
+                threshold = threshold.coerceIn(0.25f, 0.75f),
                 minSilenceDuration = (pauseMs / 1000f).coerceIn(0.2f, 1.2f),
-                minSpeechDuration = 0.22f,
+                minSpeechDuration = minSpeech.coerceIn(0.15f, 0.6f),
                 windowSize = 512,
                 maxSpeechDuration = maxSpeech,
             ),
@@ -190,9 +238,10 @@ class SpeakerEngine {
         val model = App.instance.models.speakerModel
         if (!model.exists()) return false
         return try {
+            // 声纹属于非关键路径后处理，限制为 1 线程，避免与 SenseVoice / Hy-MT2 争抢大核。
             extractor = SpeakerEmbeddingExtractor(
                 null,
-                SpeakerEmbeddingExtractorConfig(model = model.absolutePath, numThreads = 2),
+                SpeakerEmbeddingExtractorConfig(model = model.absolutePath, numThreads = 1),
             )
             true
         } catch (_: Throwable) {

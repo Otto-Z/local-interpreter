@@ -106,8 +106,9 @@ class CourseAssistant(private val app: App) {
     }
 
     fun parsePairs(text: String): List<Pair<String, String>> {
+        val leadingNum = Regex("^\\d+[.)、]\\s*")
         return text.lines().mapNotNull { line ->
-            val clean = line.trim().trim('-', '*', '•', ' ')
+            val clean = line.trim().replace(leadingNum, "").trim('-', '*', '•', ' ')
             if (clean.isBlank()) return@mapNotNull null
             val sep = listOf("=>", "->", "→", "：", ":", "＝", "=")
                 .mapNotNull { s -> clean.indexOf(s).takeIf { it > 0 }?.let { it to s } }

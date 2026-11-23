@@ -87,17 +87,19 @@ class FileAudioCapture(
                         dataLeft = if (size <= 0) Long.MAX_VALUE else size.toLong()
                         break
                     } else {
-                        var skip = size.toLong()
+                        var skip = (size.toLong() and 0xFFFFFFFFL) + (size.toLong() and 1L)
                         while (skip > 0) {
                             val n = input.skip(skip)
-                            if (n <= 0) break
-                            skip -= n
+                            if (n <= 0) {
+                                if (input.read() < 0) break
+                                skip -= 1
+                            } else {
+                                skip -= n
+                            }
                         }
-                        if (size % 2 == 1) input.skip(1)
                     }
                 }
-                if (dataLeft < 0) throw RuntimeException("WAV 文件没有音频数据")
-                if (dataLeft == 0L) throw RuntimeException("WAV 文件没有音频数据")
+                if (dataLeft <= 0) throw RuntimeException("WAV 文件没有音频数据")
                 if (audioFormat != 1) {
                     input.close()
                     input = null
@@ -115,17 +117,23 @@ class FileAudioCapture(
                 )
                 val chunkFrames = max(256, sampleRate / 50)
                 val buf = ByteArray(chunkFrames * frameBytes)
+                var leftover = 0
                 val start = System.currentTimeMillis()
                 var fedSamples = 0L
                 while (running && dataLeft > 0) {
                     while (paused && running) Thread.sleep(80)
                     if (!running) break
-                    val want = min(buf.size.toLong(), dataLeft).toInt() / frameBytes * frameBytes
+                    val space = buf.size - leftover
+                    val want = min(space.toLong(), dataLeft).toInt()
                     if (want <= 0) break
-                    val n = input.read(buf, 0, want)
+                    val n = input.read(buf, leftover, want)
                     if (n <= 0) break
                     dataLeft -= n
-                    val frames = n / frameBytes
+                    val totalBytes = leftover + n
+                    val frames = totalBytes / frameBytes
+                    val consumed = frames * frameBytes
+                    leftover = totalBytes - consumed
+                    if (frames == 0) continue
                     val mono = FloatArray(frames)
                     for (i in 0 until frames) {
                         var sum = 0f
@@ -135,6 +143,9 @@ class FileAudioCapture(
                             sum += ((hi shl 8) or lo).toShort() / 32768f
                         }
                         mono[i] = sum / channels
+                    }
+                    if (leftover > 0) {
+                        System.arraycopy(buf, consumed, buf, 0, leftover)
                     }
                     val out = if (sampleRate == 16000) mono else resample(mono, sampleRate, 16000)
                     if (out.isNotEmpty()) {
@@ -149,14 +160,18 @@ class FileAudioCapture(
                 }
                 normalEnd = true
             } catch (t: Throwable) {
-                AppLog.e("Audio", "读取音频文件失败", t)
-                if (running) {
-                    val msg = if (t is SecurityException || t.cause is SecurityException) {
-                        "没有读取该文件的权限，请用主界面的「音频文件」重新选择"
-                    } else {
-                        "无法读取音频文件：${t.message ?: "格式不支持"}"
+                if (t is InterruptedException && !running) {
+                    // stop() 主动中断睡眠/等待，不当作错误上报。
+                } else {
+                    AppLog.e("Audio", "读取音频文件失败", t)
+                    if (running) {
+                        val msg = if (t is SecurityException || t.cause is SecurityException) {
+                            "没有读取该文件的权限，请用主界面的「音频文件」重新选择"
+                        } else {
+                            "无法读取音频文件：${t.message ?: "格式不支持"}"
+                        }
+                        onError(msg)
                     }
-                    onError(msg)
                 }
             } finally {
                 try { input?.close() } catch (_: Exception) {}
@@ -201,6 +216,7 @@ class FileAudioCapture(
             var inputDone = false
             var outputDone = false
             val wallStart = System.currentTimeMillis()
+            var firstPtsUs = -1L
             var fedFrames = 0L
             while (running && !outputDone) {
                 while (paused && running) Thread.sleep(80)
@@ -240,8 +256,14 @@ class FileAudioCapture(
                             val resampled = if (sampleRate == 16000) pcm else resample(pcm, sampleRate, 16000)
                             if (resampled.isNotEmpty() && running) {
                                 onFrames(resampled)
-                                val targetMs = if (info.presentationTimeUs > 0) {
-                                    info.presentationTimeUs / 1000.0 / speed
+                                if (firstPtsUs < 0 && info.presentationTimeUs >= 0) {
+                                    firstPtsUs = info.presentationTimeUs
+                                }
+                                val relPtsUs = if (firstPtsUs >= 0 && info.presentationTimeUs >= firstPtsUs) {
+                                    info.presentationTimeUs - firstPtsUs
+                                } else -1L
+                                val targetMs = if (relPtsUs > 0) {
+                                    relPtsUs / 1000.0 / speed
                                 } else {
                                     fedFrames * 1000.0 / sampleRate.coerceAtLeast(1) / speed
                                 }
@@ -264,8 +286,9 @@ class FileAudioCapture(
 
     private fun decodeToFloat(buf: java.nio.ByteBuffer, size: Int, encoding: Int, channels: Int): FloatArray {
         val b = buf.slice().order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        val frameBytes: Int
-        when (encoding) {
+        val pcm24Packed = 21 // AudioFormat.ENCODING_PCM_24BIT_PACKED (API 31)
+        val pcm32 = 22 // AudioFormat.ENCODING_PCM_32BIT (API 31)
+        val bytesPerSample = when (encoding) {
             AudioFormat.ENCODING_PCM_FLOAT -> {
                 val fb = b.asFloatBuffer()
                 val frames = size / (4 * channels)
@@ -277,21 +300,38 @@ class FileAudioCapture(
                 }
                 return out
             }
-            AudioFormat.ENCODING_PCM_8BIT -> frameBytes = channels
-            else -> frameBytes = 2 * channels
+            AudioFormat.ENCODING_PCM_8BIT -> 1
+            pcm24Packed -> 3
+            pcm32 -> 4
+            else -> 2
         }
+        val frameBytes = bytesPerSample * channels
         val frames = size / frameBytes
         val out = FloatArray(frames)
         for (i in 0 until frames) {
             var sum = 0f
             for (c in 0 until channels) {
-                val off = i * frameBytes + c * (frameBytes / channels)
-                sum += if (encoding == AudioFormat.ENCODING_PCM_8BIT) {
-                    (b.get(off).toInt() and 0xff) / 128f - 1f
-                } else {
-                    val lo = b.get(off).toInt() and 0xff
-                    val hi = b.get(off + 1).toInt()
-                    ((hi shl 8) or lo).toShort() / 32768f
+                val off = i * frameBytes + c * bytesPerSample
+                sum += when (encoding) {
+                    AudioFormat.ENCODING_PCM_8BIT -> (b.get(off).toInt() and 0xff) / 128f - 1f
+                    pcm24Packed -> {
+                        val b0 = b.get(off).toInt() and 0xff
+                        val b1 = b.get(off + 1).toInt() and 0xff
+                        val b2 = b.get(off + 2).toInt()
+                        ((b2 shl 16) or (b1 shl 8) or b0) / 8388608f
+                    }
+                    pcm32 -> {
+                        val b0 = b.get(off).toInt() and 0xff
+                        val b1 = b.get(off + 1).toInt() and 0xff
+                        val b2 = b.get(off + 2).toInt() and 0xff
+                        val b3 = b.get(off + 3).toInt()
+                        ((b3 shl 24) or (b2 shl 16) or (b1 shl 8) or b0) / 2147483648f
+                    }
+                    else -> {
+                        val lo = b.get(off).toInt() and 0xff
+                        val hi = b.get(off + 1).toInt()
+                        ((hi shl 8) or lo).toShort() / 32768f
+                    }
                 }
             }
             out[i] = sum / channels
@@ -332,7 +372,9 @@ class FileAudioCapture(
 
     override fun stop() {
         running = false
-        thread?.join(600)
+        val t = thread
         thread = null
+        t?.interrupt()
+        runCatching { t?.join(800) }
     }
 }

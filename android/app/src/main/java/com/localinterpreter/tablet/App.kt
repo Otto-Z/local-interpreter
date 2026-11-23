@@ -83,9 +83,12 @@ class App : Application() {
             runCatching { live.onMemoryPressure(level) }
         }
         if (level >= TRIM_MEMORY_COMPLETE) {
-            // 后台且系统要回收：把已加载的大模型放掉；下次进入会重新预热。
-            appScope.launch {
-                runCatching { llm.unloadTranslator() }
+            // 仅在空闲时卸载翻译模型；后台开着浮字幕进行同传时不能中途卸掉翻译器。
+            val st = live.state.value
+            if (!st.running && !st.starting) {
+                appScope.launch {
+                    runCatching { llm.unloadTranslator() }
+                }
             }
         }
     }

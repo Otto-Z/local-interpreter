@@ -5,8 +5,11 @@ import com.localinterpreter.tablet.data.SettingsData
 import com.localinterpreter.tablet.util.AppLog
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -25,6 +28,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 object Langs {
@@ -204,11 +208,34 @@ class ThinkStreamFilter {
     }
 }
 
+/**
+ * 在 IO 线程执行阻塞的 JNI/HTTP 调用，并在协程取消时**立刻**触发 [onCancel]，
+ * 不必等到阻塞调用返回才感知取消（避免提示词 prefill 或网络建连阶段卡死）。
+ */
+private suspend fun <T> runCancellableBlocking(onCancel: () -> Unit, block: () -> T): T =
+    kotlinx.coroutines.coroutineScope {
+        val finished = AtomicBoolean(false)
+        val watcher = launch(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
+            try {
+                awaitCancellation()
+            } finally {
+                if (!finished.get()) runCatching { onCancel() }
+            }
+        }
+        try {
+            withContext(Dispatchers.IO) { block() }
+        } finally {
+            finished.set(true)
+            watcher.cancel()
+        }
+    }
+
 class LocalLlm(
     private val path: File,
     private val contextSize: Int,
     val threads: Int,
     val label: String,
+    val useGpu: Boolean = false,
 ) {
     private val mutex = Mutex()
     private val lifecycleLock = Any()
@@ -229,10 +256,12 @@ class LocalLlm(
             val started = System.currentTimeMillis()
             val needBytes = (path.length() * 0.6).toLong().coerceIn(400L * 1024 * 1024, 1_800_000_000L)
             val availBytes = AppLog.availableBytes()
+            val libDir = App.instance.applicationInfo.nativeLibraryDir
+            val gpuLayers = if (useGpu && LlamaNative.hasGpuBackend(libDir)) 99 else 0
             AppLog.d(
                 "LLM",
                 "$label 开始加载 ${path.name} size=${path.length() / 1_048_576}MB ctx=$contextSize threads=$threads " +
-                    "need≈${needBytes / 1_048_576}MB ${AppLog.memory()}"
+                    "gpuLayers=$gpuLayers need≈${needBytes / 1_048_576}MB ${AppLog.memory()}"
             )
             if (availBytes < needBytes) {
                 AppLog.e(
@@ -242,8 +271,8 @@ class LocalLlm(
                 return@withContext false
             }
             try {
-                LlamaNative.ensureBackend(App.instance.applicationInfo.nativeLibraryDir)
-                val n = LlamaNative.load(path.absolutePath, contextSize, threads)
+                LlamaNative.ensureBackend(libDir)
+                val n = LlamaNative.load(path.absolutePath, contextSize, threads, gpuLayers)
                 val accepted = synchronized(lifecycleLock) {
                     if (closed) {
                         false
@@ -282,14 +311,9 @@ class LocalLlm(
             throw IllegalStateException("$label 模型加载失败（文件损坏或内存不足）")
         }
         return mutex.withLock {
-        val n = native ?: throw IllegalStateException("$label 模型未加载")
-        val job = kotlin.coroutines.coroutineContext[Job]
-        // 完成回调用的是稳定 API，但它要等阻塞的 JNI 返回才触发；真正的及时中断靠下面逐个 token 检查。
-        val handle = job?.invokeOnCompletion { cause ->
-            if (cause is CancellationException) n.cancel()
-        }
-        try {
-            withContext(Dispatchers.IO) {
+            val n = native ?: throw IllegalStateException("$label 模型未加载")
+            val job = kotlin.coroutines.coroutineContext[Job]
+            runCancellableBlocking(onCancel = { n.cancel() }) {
                 // close() 会等待这个锁，避免 native 句柄在生成过程中被释放（use-after-free）。
                 synchronized(nativeLock) {
                     if (closed) throw IllegalStateException("$label 已卸载")
@@ -299,9 +323,6 @@ class LocalLlm(
                     }
                 }
             }
-        } finally {
-            handle?.dispose()
-        }
         }
     }
 
@@ -347,7 +368,7 @@ class ApiLlm(
         temperature: Float,
         onToken: ((String) -> Unit)? = null,
         stream: Boolean = true,
-    ): String = withContext(Dispatchers.IO) {
+    ): String {
         val base = normalizeBase(baseUrl)
         if (base.isBlank()) throw RuntimeException("接口地址为空")
         val messages = JSONArray()
@@ -392,34 +413,32 @@ class ApiLlm(
                 )
                 active.set(call)
                 val job = kotlin.coroutines.coroutineContext[Job]
-                // 完成回调要等请求结束才触发；读循环里再按 isCancelled 主动断开，才有「立刻停止」的效果。
-                val handle = job?.invokeOnCompletion { cause ->
-                    if (cause is CancellationException) runCatching { call.cancel() }
-                }
                 try {
                     val started = System.currentTimeMillis()
-                    val text = call.execute().use { resp ->
-                        if (!resp.isSuccessful) {
-                            val bodyText = runCatching { resp.body?.string() }.getOrNull()?.take(300).orEmpty()
-                            throw ApiHttpException(resp.code, "HTTP ${resp.code} $bodyText")
+                    val text = runCancellableBlocking(onCancel = { call.cancel() }) {
+                        call.execute().use { resp ->
+                            if (!resp.isSuccessful) {
+                                val bodyText = runCatching { resp.body?.string() }.getOrNull()?.take(300).orEmpty()
+                                throw ApiHttpException(resp.code, "HTTP ${resp.code} $bodyText")
+                            }
+                            AppLog.d(
+                                "LLM-API",
+                                "响应 HTTP ${resp.code} type=${resp.header("Content-Type") ?: "-"} " +
+                                    "wait=${System.currentTimeMillis() - started}ms",
+                            )
+                            readResponse(resp, onToken) { job?.isCancelled == true }
                         }
-                        AppLog.d(
-                            "LLM-API",
-                            "响应 HTTP ${resp.code} type=${resp.header("Content-Type") ?: "-"} " +
-                                "wait=${System.currentTimeMillis() - started}ms",
-                        )
-                        readResponse(resp, onToken) { job?.isCancelled == true }
                     }
                     AppLog.d(
                         "LLM-API",
                         "完成 ${System.currentTimeMillis() - started}ms out=${text.length}字 stream=$stream url=$url",
                     )
-                    return@withContext text
+                    return text
                 } catch (e: ApiHttpException) {
                     lastError = e
                     AppLog.e("LLM-API", "请求失败 url=$url disableThinking=$disableThinking ${e.message?.take(200)}")
-                    // 服务端不接受 chat_template_kwargs 时，去掉该参数重试一次。
-                    if (e.code == 400 && disableThinking) continue
+                    // 服务端不接受 chat_template_kwargs（常见 400 或 FastAPI 422）时，去掉该参数重试一次。
+                    if ((e.code == 400 || e.code == 422) && disableThinking) continue
                     if (e.code == 404 && url != urls.last()) {
                         nextUrl = true
                         break
@@ -439,7 +458,6 @@ class ApiLlm(
                     throw e
                 } finally {
                     active.compareAndSet(call, null)
-                    handle?.dispose()
                 }
             }
             if (nextUrl) continue
@@ -604,16 +622,16 @@ class ApiLlm(
                 is JSONArray -> buildString {
                     for (i in 0 until value.length()) {
                         when (val part = value.opt(i)) {
+                            null, JSONObject.NULL -> Unit
                             is JSONObject -> append(
                                 contentOf(part, "text").ifEmpty { contentOf(part, "content") }
                             )
                             is String -> append(part)
-                            JSONObject.NULL -> Unit
                             else -> append(part.toString())
                         }
                     }
                 }
-                JSONObject.NULL -> ""
+                null, JSONObject.NULL -> ""
                 else -> value.toString()
             }
         }
@@ -669,7 +687,10 @@ class ApiLlm(
         }
 
         fun listModels(baseUrl: String, apiKey: String): List<String> {
-            val client = OkHttpClient.Builder().connectTimeout(5, TimeUnit.SECONDS).readTimeout(10, TimeUnit.SECONDS).build()
+            val client = sharedClient.newBuilder()
+                .connectTimeout(5, TimeUnit.SECONDS)
+                .readTimeout(10, TimeUnit.SECONDS)
+                .build()
             var base = normalizeBase(baseUrl)
             if (base.isBlank()) return emptyList()
             if (base.endsWith("/chat/completions")) base = base.removeSuffix("/chat/completions")
@@ -696,14 +717,18 @@ class ApiLlm(
 }
 
 class LlmService(private val app: App) {
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val translatorLock = Mutex()
     private val assistantLock = Mutex()
+    @Volatile private var warmUpJob: Job? = null
     @Volatile private var translator: LocalLlm? = null
     @Volatile private var translatorPath: String = ""
     @Volatile private var translatorThreads: Int = 0
+    @Volatile private var translatorUseGpu: Boolean = false
     @Volatile private var assistant: LocalLlm? = null
     @Volatile private var assistantPath: String = ""
     @Volatile private var assistantThreads: Int = 0
+    @Volatile private var assistantUseGpu: Boolean = false
 
     private val apiTranslatorCalls = java.util.concurrent.ConcurrentHashMap.newKeySet<ApiLlm>()
     private val apiAssistantCalls = java.util.concurrent.ConcurrentHashMap.newKeySet<ApiLlm>()
@@ -712,6 +737,10 @@ class LlmService(private val app: App) {
     val translatorStatus: StateFlow<String> = _translatorStatus.asStateFlow()
     private val _assistantStatus = MutableStateFlow("未加载")
     val assistantStatus: StateFlow<String> = _assistantStatus.asStateFlow()
+
+    fun hasGpuBackend(): Boolean = LlamaNative.hasGpuBackend(app.applicationInfo.nativeLibraryDir)
+
+    fun backendSummary(): String = LlamaNative.backendSummary(app.applicationInfo.nativeLibraryDir)
 
     private fun localTranslator(s: SettingsData = app.settings.value): LocalLlm? {
         val file = app.models.translatorModel(s.modelVariant)
@@ -723,14 +752,19 @@ class LlmService(private val app: App) {
             return null
         }
         val path = file.absolutePath
-        if (translator?.loaded == true && translatorPath == path && translatorThreads == s.llmThreads) return translator
+        if (translator?.loaded == true && translatorPath == path &&
+            translatorThreads == s.llmThreads && translatorUseGpu == s.useGpu
+        ) return translator
         return synchronized(this) {
-            if (translatorPath != path || translator == null || translatorThreads != s.llmThreads) {
+            if (translatorPath != path || translator == null ||
+                translatorThreads != s.llmThreads || translatorUseGpu != s.useGpu
+            ) {
                 val old = translator
-                // 翻译只处理「一句原文 + 可选术语表」，2048 已经宽裕；再大只会让 KV 分配/拷贝变慢。
-                translator = LocalLlm(file, 1536, s.llmThreads, "Hy-MT2")
+                // 翻译只处理「一句原文 + 可选术语表」，1536 已经宽裕；再大只会让 KV 分配/拷贝变慢。
+                translator = LocalLlm(file, 1536, s.llmThreads, "Hy-MT2", s.useGpu)
                 translatorPath = path
                 translatorThreads = s.llmThreads
+                translatorUseGpu = s.useGpu
                 old?.let { closeInBackground(it) }
             }
             translator
@@ -863,13 +897,18 @@ class LlmService(private val app: App) {
         }
         val label = if (s.assistantVariant == "1.5b") "Qwen2.5-1.5B" else "Qwen3-4B"
         val path = file.absolutePath
-        if (assistant?.loaded == true && assistantPath == path && assistantThreads == s.llmThreads) return assistant
+        if (assistant?.loaded == true && assistantPath == path &&
+            assistantThreads == s.llmThreads && assistantUseGpu == s.useGpu
+        ) return assistant
         return synchronized(this) {
-            if (assistantPath != path || assistant == null || assistantThreads != s.llmThreads) {
+            if (assistantPath != path || assistant == null ||
+                assistantThreads != s.llmThreads || assistantUseGpu != s.useGpu
+            ) {
                 val old = assistant
-                assistant = LocalLlm(file, 6144, s.llmThreads, label)
+                assistant = LocalLlm(file, 6144, s.llmThreads, label, s.useGpu)
                 assistantPath = path
                 assistantThreads = s.llmThreads
+                assistantUseGpu = s.useGpu
                 old?.let { closeInBackground(it) }
             }
             assistant
@@ -877,36 +916,52 @@ class LlmService(private val app: App) {
     }
 
     /**
-     * 设置里的线程数变了以后调用：把已加载的本地模型卸掉，下次会话按新线程数重建。
-     * 只影响本地模型；API 模式无需处理。
+     * 设置里的线程数变了以后调用：先同步摘除旧的本地模型句柄（后台安全释放），
+     * 可选立即按新线程数预热翻译模型，彻底避免卸载线程与预热协程竞态把新模型卸掉。
      */
-    fun reloadLocalModelsForThreadChange() {
-        val t = Thread({
-            runCatching { unloadTranslator() }
-            runCatching { unloadAssistant() }
-            AppLog.d("LLM", "线程数已变更，已卸载本地模型，下次使用按新线程数加载")
-        }, "llm-reload")
-        t.isDaemon = true
-        t.start()
+    fun reloadLocalModelsForThreadChange(warmUp: Boolean = false) {
+        warmUpJob?.cancel()
+        warmUpJob = null
+        unloadTranslator()
+        unloadAssistant()
+        AppLog.d("LLM", "线程数已变更，已卸载本地模型，下次使用按新线程数加载")
+        if (warmUp) warmUpTranslator()
     }
 
-    fun warmUpTranslator() {
-        if (app.settings.value.llmMode != SettingsData.MODE_BUILTIN) return
-        val llm = localTranslator() ?: return
+    fun warmUpTranslator(glossary: String = "") {
+        val s = app.settings.value
+        if (s.llmMode != SettingsData.MODE_BUILTIN) return
+        val llm = localTranslator(s) ?: return
+        warmUpJob?.cancel()
         _translatorStatus.value = "加载中…"
-        CoroutineScope(Dispatchers.IO).launch {
+        warmUpJob = serviceScope.launch {
             if (!llm.ensureLoaded()) {
-                _translatorStatus.value = "内置模型加载失败"
+                if (translator === llm) _translatorStatus.value = "内置模型加载失败"
                 return@launch
             }
-            // 只加载权重还不够：第一句的开销大头是 KV 缓冲分配和首个 prefill。
-            // 这里跑一次极短的生成，把两条路径都走热，正式会话的首字延迟就不会包含冷启动。
+            // 只加载权重还不够：第一句的开销大头是 KV 缓冲分配和首个 System Prompt + 术语表 prefill。
+            // 按当前目标语言与术语表跑一次极短贪心生成，让第一句真实字幕直接命中 KV Prefix Cache。
             val started = System.currentTimeMillis()
+            val warmTarget = when {
+                s.targetLang != "auto" -> s.targetLang
+                s.sourceLang.startsWith("zh") || s.sourceLang.startsWith("yue") -> "en"
+                else -> "zh"
+            }
+            var warmSystem = Prompts.translate(warmTarget)
+            if (glossary.isNotBlank()) {
+                val capped = if (glossary.length > 480) glossary.take(480) else glossary
+                warmSystem += "\n\n术语表（保持译名一致）：$capped"
+            }
+            val warmUser = if (warmTarget == "en") "你好" else "Hello"
             runCatching {
-                llm.generate(Prompts.translate("en"), "你好", 8, 0.2f)
-            }.onFailure { AppLog.e("LLM", "预热生成失败（不影响使用）", it) }
-            _translatorStatus.value = "内置模型就绪"
-            AppLog.d("LLM", "翻译模型预热完成 ${System.currentTimeMillis() - started}ms")
+                llm.generate(warmSystem, warmUser, 4, 0.0f)
+            }.onFailure {
+                if (it !is CancellationException) AppLog.e("LLM", "预热生成失败（不影响使用）", it)
+            }
+            if (translator === llm && llm.loaded) {
+                _translatorStatus.value = "内置模型就绪"
+                AppLog.d("LLM", "翻译模型预热完成 ${System.currentTimeMillis() - started}ms target=$warmTarget")
+            }
         }
     }
 
@@ -915,10 +970,11 @@ class LlmService(private val app: App) {
         srcLang: String,
         target: String,
         glossary: String = "",
-        maxTokens: Int = 300,
-        temperature: Float = 0.3f,
+        maxTokens: Int = 260,
+        temperature: Float = 0.0f,
         allowEmpty: Boolean = false,
         config: SettingsData? = null,
+        context: String = "",
         onToken: ((String) -> Unit)? = null,
     ): String {
         if (text.isBlank()) return ""
@@ -929,13 +985,20 @@ class LlmService(private val app: App) {
             "翻译请求 mode=${s.llmMode} " +
                 "model=${if (s.llmMode == SettingsData.MODE_API) s.apiModel else "Hy-MT2/${s.modelVariant}"} " +
                 "base=${if (s.llmMode == SettingsData.MODE_API) s.apiBaseUrl else "local"} " +
-                "src=$srcLang target=$tgt text=${text.length}字 glossary=${glossary.length}字",
+                "src=$srcLang target=$tgt text=${text.length}字 ctx=${context.length}字 glossary=${glossary.length}字",
         )
         var system = Prompts.translate(tgt)
         if (glossary.isNotBlank()) {
-            // 翻译模型只有 2048 上下文；术语表过长会把正文挤出去，导致整句没有输出。
-            val capped = if (glossary.length > 400) glossary.take(400) else glossary
+            // 翻译模型只有 1536 上下文；术语表过长会把正文挤出去，导致整句没有输出。
+            val capped = if (glossary.length > 480) glossary.take(480) else glossary
             system += "\n\n术语表（保持译名一致）：$capped"
+        }
+        // 前文上下文放在 user 消息中而非 system，确保 System Prompt + 术语表的 KV Prefix Cache 始终 100% 命中。
+        val userPrompt = if (context.isNotBlank()) {
+            val cappedCtx = if (context.length > 260) context.takeLast(260) else context
+            "前文参考（仅用于理解代词与语境，不要重复翻译）：\n$cappedCtx\n\n请只翻译这一句：\n$text"
+        } else {
+            text
         }
         val filter = ThinkStreamFilter()
         val stream: ((String) -> Unit)? = if (onToken == null) null else { piece ->
@@ -943,7 +1006,8 @@ class LlmService(private val app: App) {
             if (clean.isNotEmpty()) onToken(clean)
         }
         val started = System.currentTimeMillis()
-        val timedOut = java.util.concurrent.atomic.AtomicBoolean(false)
+        val timedOut = AtomicBoolean(false)
+        val activeLocal = AtomicReference<LocalLlm?>(null)
         val raw = try {
             kotlinx.coroutines.coroutineScope {
                 // withTimeout 无法打断阻塞的 JNI/OkHttp 调用；用看门狗直接取消当前生成。
@@ -955,7 +1019,7 @@ class LlmService(private val app: App) {
                     if (s.llmMode == SettingsData.MODE_API) {
                         apiTranslatorCalls.forEach { runCatching { it.cancel() } }
                     } else {
-                        translator?.cancel()
+                        (activeLocal.get() ?: translator)?.cancel()
                     }
                 }
                 try {
@@ -965,7 +1029,7 @@ class LlmService(private val app: App) {
                             _translatorStatus.value = "API 未配置"
                             throw RuntimeException("请先在设置里填写接口地址和模型")
                         }
-                        apiTranslateWithRetry(s, system, text, maxTokens, temperature, stream).also {
+                        apiTranslateWithRetry(s, system, userPrompt, maxTokens, temperature, stream).also {
                             _translatorStatus.value = "API · ${s.apiModel.ifBlank { "未填模型" }}"
                         }
                     } else {
@@ -973,9 +1037,10 @@ class LlmService(private val app: App) {
                         if (llm == null) {
                             throw RuntimeException(_translatorStatus.value)
                         }
+                        activeLocal.set(llm)
                         translatorLock.withLock {
                             _translatorStatus.value = if (llm.loaded) "内置模型就绪" else "加载中…"
-                            val out = llm.generate(system, text, maxTokens, temperature, stream)
+                            val out = llm.generate(system, userPrompt, maxTokens, temperature, stream)
                             if (llm.loaded) _translatorStatus.value = "内置模型就绪"
                             out
                         }
@@ -1004,6 +1069,8 @@ class LlmService(private val app: App) {
             AppLog.e("LLM", "翻译失败 ${System.currentTimeMillis() - started}ms mode=${s.llmMode} text=${text.take(40)}", e)
             throw e
         }
+        val tail = filter.finish()
+        if (tail.isNotEmpty()) onToken?.invoke(tail)
         if (timedOut.get()) {
             val partial = Think.strip(raw)
             _translatorStatus.value = "翻译超时"
@@ -1047,7 +1114,8 @@ class LlmService(private val app: App) {
         val started = System.currentTimeMillis()
         // 平板 CPU 生成 400 字左右可能超过两分钟，本地模型给足时间；API 仍按网络超时处理。
         val timeoutMs = if (s.analysisMode == SettingsData.MODE_API) 120_000L else 240_000L
-        val timedOut = java.util.concurrent.atomic.AtomicBoolean(false)
+        val timedOut = AtomicBoolean(false)
+        val activeLocal = AtomicReference<LocalLlm?>(null)
         val raw = try {
             kotlinx.coroutines.coroutineScope {
                 val watchdog = launch {
@@ -1057,7 +1125,7 @@ class LlmService(private val app: App) {
                     if (s.analysisMode == SettingsData.MODE_API) {
                         apiAssistantCalls.forEach { runCatching { it.cancel() } }
                     } else {
-                        assistant?.cancel()
+                        (activeLocal.get() ?: assistant)?.cancel()
                     }
                 }
                 try {
@@ -1075,6 +1143,7 @@ class LlmService(private val app: App) {
                         }
                     } else {
                         val llm = localAssistant() ?: throw RuntimeException(_assistantStatus.value)
+                        activeLocal.set(llm)
                         assistantLock.withLock {
                             if (!llm.ensureLoaded()) {
                                 throw RuntimeException("助教模型加载失败（文件损坏或内存不足）")
@@ -1099,6 +1168,8 @@ class LlmService(private val app: App) {
             AppLog.e("LLM", "助教生成失败 ${System.currentTimeMillis() - started}ms", e)
             throw e
         }
+        val tail = filter.finish()
+        if (tail.isNotEmpty()) onToken?.invoke(tail)
         if (timedOut.get()) {
             val partial = raw?.let { Think.strip(it) }.orEmpty()
             _assistantStatus.value = "助教生成超时"
@@ -1134,7 +1205,7 @@ class LlmService(private val app: App) {
         } catch (_: Throwable) {
             return null
         }
-        var fixed = raw.trim().trim('"', '“', '”', '「', '」', '\n', ' ')
+        val fixed = Think.strip(raw).trim('"', '“', '”', '「', '」', '\n', ' ')
         if (fixed.isBlank() || fixed == text) return text
         val cjk = fixed.count { it in '一'..'鿿' }
         val textCjk = text.count { it in '一'..'鿿' }

@@ -4,7 +4,9 @@
 
 #include <android/log.h>
 #include <jni.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -29,25 +31,68 @@ struct LlamaContext {
     std::mutex mutex;
     std::atomic<bool> cancel{false};
     int32_t n_ctx = 2048;
+    int32_t n_batch = 512;
+    llama_batch prompt_batch{};
+    llama_batch single_batch{};
+    bool batches_ready = false;
+    std::vector<llama_token> cached_tokens;
 };
 
-static bool is_valid_utf8(const char *string) {
-    if (!string) return true;
-    const auto *bytes = (const unsigned char *) string;
-    int num;
-    while (*bytes != 0x00) {
-        if ((*bytes & 0x80) == 0x00) num = 1;
-        else if ((*bytes & 0xE0) == 0xC0) num = 2;
-        else if ((*bytes & 0xF0) == 0xE0) num = 3;
-        else if ((*bytes & 0xF8) == 0xF0) num = 4;
-        else return false;
-        bytes += 1;
-        for (int i = 1; i < num; ++i) {
-            if ((*bytes & 0xC0) != 0x80) return false;
-            bytes += 1;
+static bool llama_abort_cb(void *data) {
+    auto *h = static_cast<LlamaContext *>(data);
+    return h && h->cancel.load(std::memory_order_relaxed);
+}
+
+// Returns how many leading bytes of `s` can be emitted immediately.
+// Only an incomplete multi-byte UTF-8 sequence at the very end of `s` is held back;
+// invalid bytes are allowed through so utf8_to_utf16 turns them into U+FFFD instead of
+// stalling all subsequent streaming tokens forever.
+static size_t utf8_flushable_len(const std::string &s) {
+    size_t i = 0;
+    const size_t len = s.size();
+    while (i < len) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t need = 0;
+        if (c < 0x80) {
+            i += 1;
+            continue;
+        } else if ((c & 0xE0) == 0xC0) {
+            need = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            need = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            need = 4;
+        } else {
+            // Invalid lead byte: advance past it so it is replaced rather than stalling the stream.
+            i += 1;
+            continue;
         }
+        if (i + need > len) {
+            // Check whether existing trailing bytes are valid continuation bytes; if so, wait for more.
+            bool partial_ok = true;
+            for (size_t k = i + 1; k < len; ++k) {
+                if ((static_cast<unsigned char>(s[k]) & 0xC0) != 0x80) {
+                    partial_ok = false;
+                    break;
+                }
+            }
+            if (partial_ok) {
+                return i;
+            }
+            // Broken sequence even before end: let it flush as U+FFFD.
+            i += 1;
+            continue;
+        }
+        bool valid = true;
+        for (size_t k = 1; k < need; ++k) {
+            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) {
+                valid = false;
+                break;
+            }
+        }
+        i += valid ? need : 1;
     }
-    return true;
+    return len;
 }
 
 static std::u16string utf8_to_utf16(const std::string &s) {
@@ -142,49 +187,134 @@ Java_com_localinterpreter_tablet_llm_LlamaNative_init(JNIEnv *env, jclass, jstri
         env->ReleaseStringUTFChars(libDir, path);
     }
     llama_backend_init();
+    size_t dev_count = ggml_backend_dev_count();
+    LOGI("llama backend initialized: %zu device(s)", dev_count);
+    for (size_t i = 0; i < dev_count; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        LOGI("  backend[%zu]: %s (%s)", i, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+    }
+}
+
+static bool has_gpu_backend_internal() {
+    const size_t dev_count = ggml_backend_dev_count();
+    for (size_t i = 0; i < dev_count; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        enum ggml_backend_dev_type t = ggml_backend_dev_type(dev);
+        if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            return true;
+        }
+    }
+    return false;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_localinterpreter_tablet_llm_LlamaNative_nativeHasGpuBackend(JNIEnv *, jclass) {
+    return has_gpu_backend_internal() ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_localinterpreter_tablet_llm_LlamaNative_nativeBackendSummary(JNIEnv *env, jclass) {
+    const size_t dev_count = ggml_backend_dev_count();
+    std::string out;
+    for (size_t i = 0; i < dev_count; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const char *name = ggml_backend_dev_name(dev);
+        const char *desc = ggml_backend_dev_description(dev);
+        if (!out.empty()) out += " + ";
+        if (name && name[0]) out += name;
+        if (desc && desc[0] && (!name || std::strcmp(name, desc) != 0)) {
+            out += " (";
+            out += desc;
+            out += ")";
+        }
+    }
+    if (out.empty()) out = "CPU";
+    return to_jstring(env, out);
 }
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_localinterpreter_tablet_llm_LlamaNative_create(JNIEnv *env, jclass, jstring modelPath,
-                                                        jint nCtx, jint nThreads) {
+                                                        jint nCtx, jint nThreads, jint nGpuLayers) {
     const char *path = env->GetStringUTFChars(modelPath, nullptr);
-    llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 0;
-
-    LOGI("loading model %s", path);
-    llama_model *model = llama_model_load_from_file(path, mparams);
+    const std::string path_str(path ? path : "");
     env->ReleaseStringUTFChars(modelPath, path);
-    if (!model) {
-        LOGE("failed to load model");
-        return 0;
-    }
+
+    const bool want_gpu = nGpuLayers > 0 && has_gpu_backend_internal();
+    const int32_t requested_gpu_layers = want_gpu ? nGpuLayers : 0;
 
     auto *h = new LlamaContext();
-    h->model = model;
     h->n_ctx = nCtx < 512 ? 512 : nCtx;
+    h->n_batch = h->n_ctx < 512 ? h->n_ctx : 512;
 
-    llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx = h->n_ctx;
-    cparams.n_batch = h->n_ctx < 1024 ? h->n_ctx : 1024;
-    cparams.n_ubatch = 512;
-    cparams.n_threads = nThreads > 0 ? nThreads : 4;
-    cparams.n_threads_batch = nThreads > 0 ? nThreads : 4;
-    cparams.offload_kqv = false;
-    h->ctx = llama_init_from_model(model, cparams);
-    if (!h->ctx) {
-        LOGE("failed to create context");
-        llama_model_free(model);
-        delete h;
-        return 0;
+    const int32_t threads = nThreads > 0 ? nThreads : 4;
+    const int32_t online = std::max(1, (int32_t) sysconf(_SC_NPROCESSORS_ONLN));
+    // Prefill is compute-bound while token decode is memory-bandwidth-bound; when user allows >=4 threads,
+    // use up to (online - 1, capped at 6) for faster prompt prefill without hurting UI responsiveness.
+    const int32_t batch_threads = threads >= 4
+        ? std::min(6, std::max(threads, online - 1))
+        : threads;
+
+    auto try_init = [&](int32_t gpu_layers) -> bool {
+        llama_model_params mparams = llama_model_default_params();
+        mparams.n_gpu_layers = gpu_layers;
+        mparams.use_extra_bufts = true;
+
+        LOGI("loading model %s (gpu_layers=%d)", path_str.c_str(), gpu_layers);
+        llama_model *model = llama_model_load_from_file(path_str.c_str(), mparams);
+        if (!model) {
+            LOGE("failed to load model (gpu_layers=%d)", gpu_layers);
+            return false;
+        }
+
+        llama_context_params cparams = llama_context_default_params();
+        cparams.n_ctx = h->n_ctx;
+        cparams.n_batch = h->n_batch;
+        cparams.n_ubatch = h->n_batch;
+        cparams.n_threads = threads;
+        cparams.n_threads_batch = batch_threads;
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        cparams.offload_kqv = gpu_layers > 0;
+        cparams.no_perf = true;
+        cparams.abort_callback = llama_abort_cb;
+        cparams.abort_callback_data = h;
+        llama_context *ctx = llama_init_from_model(model, cparams);
+        if (!ctx) {
+            LOGE("failed to create context (gpu_layers=%d)", gpu_layers);
+            llama_model_free(model);
+            return false;
+        }
+        h->model = model;
+        h->ctx = ctx;
+        return true;
+    };
+
+    int32_t active_gpu_layers = requested_gpu_layers;
+    if (!try_init(requested_gpu_layers)) {
+        if (requested_gpu_layers > 0) {
+            LOGW("GPU initialization failed, seamlessly falling back to CPU backend");
+            active_gpu_layers = 0;
+            if (!try_init(0)) {
+                delete h;
+                return 0;
+            }
+        } else {
+            delete h;
+            return 0;
+        }
     }
 
+    h->prompt_batch = llama_batch_init(h->n_batch, 0, 1);
+    h->single_batch = llama_batch_init(1, 0, 1);
+    h->batches_ready = true;
+
     try {
-        h->templates = common_chat_templates_init(model, "");
+        h->templates = common_chat_templates_init(h->model, "");
         h->has_template = h->templates != nullptr;
     } catch (...) {
         h->has_template = false;
     }
-    LOGI("model ready, ctx=%d", h->n_ctx);
+    LOGI("model ready, ctx=%d threads=%d batch_threads=%d gpu_layers=%d",
+         h->n_ctx, threads, batch_threads, active_gpu_layers);
     return reinterpret_cast<jlong>(h);
 }
 
@@ -227,14 +357,15 @@ Java_com_localinterpreter_tablet_llm_LlamaNative_generate(
     auto *h = reinterpret_cast<LlamaContext *>(handle);
     if (!h) return env->NewStringUTF("");
     std::lock_guard<std::mutex> lock(h->mutex);
-    h->cancel.store(false);
+    h->cancel.store(false, std::memory_order_relaxed);
 
     std::string system = jstring_to_string(env, jsystem);
     std::string user = jstring_to_string(env, juser);
-    std::string full;
     if (user.empty()) {
         return env->NewStringUTF("");
     }
+    std::string full;
+    full.reserve((size_t) std::max(64, maxTokens) * 3);
 
     const llama_vocab *vocab = llama_model_get_vocab(h->model);
     int32_t reserve = maxTokens + 16;
@@ -267,12 +398,35 @@ Java_com_localinterpreter_tablet_llm_LlamaNative_generate(
         return env->NewStringUTF("");
     }
 
-    llama_memory_clear(llama_get_memory(h->ctx), true);
+    llama_memory_t mem = llama_get_memory(h->ctx);
+    // Reuse KV cache for matching prompt prefix (e.g. identical system prompt + glossary
+    // across consecutive translations), leaving at least 1 token to decode for fresh logits.
+    size_t common_prefix = 0;
+    const size_t max_reuse = tokens.size() > 1 ? tokens.size() - 1 : 0;
+    const size_t limit = std::min(h->cached_tokens.size(), max_reuse);
+    while (common_prefix < limit && h->cached_tokens[common_prefix] == tokens[common_prefix]) {
+        common_prefix++;
+    }
+    if (common_prefix > 0) {
+        if (!llama_memory_seq_rm(mem, 0, (llama_pos) common_prefix, -1)) {
+            llama_memory_clear(mem, false);
+            h->cached_tokens.clear();
+            common_prefix = 0;
+        }
+    } else {
+        llama_memory_clear(mem, false);
+        h->cached_tokens.clear();
+    }
 
-    const int32_t n_batch = (int32_t) llama_n_batch(h->ctx);
-    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    const int32_t n_batch = h->n_batch;
+    llama_batch &batch = h->prompt_batch;
     int32_t rc = 0;
-    for (int32_t off = 0; off < (int32_t) tokens.size(); off += n_batch) {
+    bool cancelled = false;
+    for (int32_t off = (int32_t) common_prefix; off < (int32_t) tokens.size(); off += n_batch) {
+        if (h->cancel.load(std::memory_order_relaxed)) {
+            cancelled = true;
+            break;
+        }
         int32_t n = std::min(n_batch, (int32_t) tokens.size() - off);
         for (int32_t j = 0; j < n; ++j) {
             int32_t idx = off + j;
@@ -284,23 +438,43 @@ Java_com_localinterpreter_tablet_llm_LlamaNative_generate(
         }
         batch.n_tokens = n;
         rc = llama_decode(h->ctx, batch);
-        if (rc != 0) break;
+        if (rc != 0) {
+            if (h->cancel.load(std::memory_order_relaxed)) cancelled = true;
+            break;
+        }
     }
-    llama_batch_free(batch);
-    if (rc != 0) {
-        LOGE("prompt decode failed: %d", rc);
+    if (cancelled || rc != 0) {
+        if (rc != 0 && !cancelled) LOGE("prompt decode failed: %d", rc);
+        // Only preserve cached_tokens up to common_prefix that was already intact before prefill.
+        if (common_prefix > 0) {
+            llama_memory_seq_rm(mem, 0, (llama_pos) common_prefix, -1);
+            h->cached_tokens.resize(common_prefix);
+        } else {
+            h->cached_tokens.clear();
+            llama_memory_clear(mem, false);
+        }
         return env->NewStringUTF("");
     }
+    h->cached_tokens = tokens;
 
     const llama_token eos_token = llama_vocab_eos(vocab);
     const llama_token eot_token = llama_vocab_eot(vocab);
 
     llama_sampler *smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
-            llama_vocab_n_tokens(vocab), 64, 1.05f, 0.0f, 0.0f));
-    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
-    llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature <= 0.f ? 0.3f : temperature));
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    if (temperature <= 0.05f) {
+        // 实时翻译使用确定性贪心解码：跳过 15 万词表全排序/softmax/随机数，既更快又更稳。
+        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
+                llama_vocab_n_tokens(vocab), 32, 1.05f, 0.0f, 0.0f));
+        llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+    } else {
+        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
+                llama_vocab_n_tokens(vocab), 64, 1.05f, 0.0f, 0.0f));
+        // 先用 top_k(24) 裁掉绝大部分候选，把 top_p 排序规模从 ~15 万降到 24。
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(24));
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature));
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    }
 
     llama_pos n_past = (llama_pos) tokens.size();
 
@@ -312,10 +486,11 @@ Java_com_localinterpreter_tablet_llm_LlamaNative_generate(
     }
 
     std::string pending;
+    pending.reserve(32);
     int32_t generated = 0;
-    llama_batch single = llama_batch_init(1, 0, 1);
+    llama_batch &single = h->single_batch;
     while (generated < maxTokens) {
-        if (h->cancel.load()) break;
+        if (h->cancel.load(std::memory_order_relaxed)) break;
         if (n_past >= h->n_ctx - 1) break;
 
         llama_token id = llama_sampler_sample(smpl, h->ctx, -1);
@@ -336,10 +511,13 @@ Java_com_localinterpreter_tablet_llm_LlamaNative_generate(
         }
         if (n > 0) {
             pending.append(src, (size_t) n);
-            if (is_valid_utf8(pending.c_str())) {
-                full += pending;
+            const size_t flush_len = utf8_flushable_len(pending);
+            if (flush_len > 0) {
+                std::string piece = pending.substr(0, flush_len);
+                pending.erase(0, flush_len);
+                full += piece;
                 if (callback && cbMethod) {
-                    jstring js = to_jstring(env, pending);
+                    jstring js = to_jstring(env, piece);
                     env->CallVoidMethod(callback, cbMethod, js);
                     env->DeleteLocalRef(js);
                     if (env->ExceptionCheck()) {
@@ -347,11 +525,10 @@ Java_com_localinterpreter_tablet_llm_LlamaNative_generate(
                         callback = nullptr;
                     }
                 }
-                pending.clear();
             }
         }
 
-        // 复用同一个 batch：每 token 新建/释放一次在小模型上也是可观的固定开销。
+        if (h->cancel.load(std::memory_order_relaxed)) break;
         single.token[0] = id;
         single.pos[0] = n_past;
         single.n_seq_id[0] = 1;
@@ -360,14 +537,22 @@ Java_com_localinterpreter_tablet_llm_LlamaNative_generate(
         single.n_tokens = 1;
         rc = llama_decode(h->ctx, single);
         if (rc != 0) {
-            LOGE("token decode failed: %d", rc);
+            if (!h->cancel.load(std::memory_order_relaxed)) {
+                LOGE("token decode failed: %d", rc);
+            }
+            // Keep intact prompt prefix tokens so the next translation still hits KV cache.
+            if (!h->cached_tokens.empty()) {
+                llama_memory_seq_rm(mem, 0, (llama_pos) h->cached_tokens.size(), -1);
+            } else {
+                llama_memory_clear(mem, false);
+            }
             break;
         }
         n_past++;
         generated++;
     }
 
-    if (!pending.empty() && is_valid_utf8(pending.c_str())) {
+    if (!pending.empty()) {
         full += pending;
         if (callback && cbMethod) {
             jstring js = to_jstring(env, pending);
@@ -377,7 +562,6 @@ Java_com_localinterpreter_tablet_llm_LlamaNative_generate(
         }
     }
 
-    llama_batch_free(single);
     llama_sampler_free(smpl);
     if (cbClass) env->DeleteLocalRef(cbClass);
     return to_jstring(env, full);
@@ -386,7 +570,7 @@ Java_com_localinterpreter_tablet_llm_LlamaNative_generate(
 extern "C" JNIEXPORT void JNICALL
 Java_com_localinterpreter_tablet_llm_LlamaNative_cancel(JNIEnv *, jclass, jlong handle) {
     auto *h = reinterpret_cast<LlamaContext *>(handle);
-    if (h) h->cancel.store(true);
+    if (h) h->cancel.store(true, std::memory_order_relaxed);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -395,7 +579,13 @@ Java_com_localinterpreter_tablet_llm_LlamaNative_destroy(JNIEnv *, jclass, jlong
     if (!h) return;
     {
         std::lock_guard<std::mutex> lock(h->mutex);
+        h->cached_tokens.clear();
         h->templates.reset();
+        if (h->batches_ready) {
+            llama_batch_free(h->prompt_batch);
+            llama_batch_free(h->single_batch);
+            h->batches_ready = false;
+        }
         if (h->ctx) llama_free(h->ctx);
         if (h->model) llama_model_free(h->model);
         h->ctx = nullptr;

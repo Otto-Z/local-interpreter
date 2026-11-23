@@ -66,7 +66,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        if (Build.VERSION.SDK_INT >= 33) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+            savedInstanceState == null
+        ) {
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
         val openUri = if (savedInstanceState == null && intent?.action == Intent.ACTION_VIEW) intent?.data else null
@@ -167,8 +170,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun launchProjection(courseId: Long?) {
-        val mpm = getSystemService(MediaProjectionManager::class.java)
-        projectionLauncher.launch(mpm.createScreenCaptureIntent())
+        try {
+            val mpm = getSystemService(MediaProjectionManager::class.java)
+                ?: throw RuntimeException("设备不支持系统音频录制")
+            projectionLauncher.launch(mpm.createScreenCaptureIntent())
+        } catch (t: Throwable) {
+            val msg = "无法拉起录屏授权：${t.message?.take(80) ?: "系统不支持"}"
+            (application as App).live.reportError(msg)
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+        }
     }
 }
 

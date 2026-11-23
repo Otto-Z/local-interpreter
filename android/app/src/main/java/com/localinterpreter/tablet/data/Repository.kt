@@ -117,9 +117,9 @@ class Repository(private val context: Context, private val db: Database) {
         PDFBoxResourceLoader.init(context)
         PDDocument.load(file).use { doc ->
             val pages = mutableListOf<Pair<Int, String>>()
-            val pageCount = doc.numberOfPages
+            val pageCount = minOf(doc.numberOfPages, 500)
+            val stripper = PDFTextStripper()
             for (i in 1..pageCount) {
-                val stripper = PDFTextStripper()
                 stripper.startPage = i
                 stripper.endPage = i
                 val text = try {
@@ -221,11 +221,21 @@ class Repository(private val context: Context, private val db: Database) {
 
     private fun stripXml(xml: String): String {
         var s = xml
-        s = s.replace(Regex("</w:p>|</a:p>"), "\n")
+        s = s.replace(Regex("</w:p>|</a:p>|<w:br[^>]*/?>|<a:br[^>]*/?>"), "\n")
         s = s.replace(Regex("<w:tab/>|<a:tab/>"), "\t")
         s = s.replace(Regex("<[^>]+>"), "")
-        s = s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+        s = s.replace(Regex("&#x([0-9a-fA-F]+);")) { m ->
+            val cp = m.groupValues[1].toIntOrNull(16)
+            if (cp != null && Character.isValidCodePoint(cp)) String(Character.toChars(cp)) else ""
+        }
+        s = s.replace(Regex("&#(\\d+);")) { m ->
+            val cp = m.groupValues[1].toIntOrNull()
+            if (cp != null && Character.isValidCodePoint(cp)) String(Character.toChars(cp)) else ""
+        }
+        s = s.replace("&nbsp;", " ")
+            .replace("&lt;", "<").replace("&gt;", ">")
             .replace("&quot;", "\"").replace("&apos;", "'")
+            .replace("&amp;", "&")
         s = s.replace(Regex("[ \\t]+\\n"), "\n")
         s = s.replace(Regex("\\n{3,}"), "\n\n")
         return s.trim()

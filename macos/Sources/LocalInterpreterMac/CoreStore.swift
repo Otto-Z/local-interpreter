@@ -46,7 +46,9 @@ final class CoreStore: ObservableObject {
     private let overlay = SubtitleOverlayController()
     private let audio = AudioCaptureService()
     private let engines = LocalEngineManager()
-    private var segmenter: SpeechSegmenterFfi?
+    private let vadLock = NSLock()
+    private var vadSegmenter: SpeechSegmenterFfi?
+    private var vadSessionId: String?
     private let segmentQueue = DispatchQueue(label: "com.localinterpreter.mac.segment")
     private var activeSessionId: String?
 
@@ -78,7 +80,7 @@ final class CoreStore: ObservableObject {
             }
         }
         audio.onSamples16k = { [weak self] pcm in
-            self?.handleCapturedSamples(pcm)
+            self?.handleCapturedSamplesOffMain(pcm)
         }
         audio.onError = { [weak self] msg in
             Task { @MainActor [weak self] in
@@ -88,6 +90,11 @@ final class CoreStore: ObservableObject {
         }
 
         reloadAll()
+    }
+
+    deinit {
+        audio.stop()
+        engines.stopAll()
     }
 
     func reloadAll() {
@@ -129,7 +136,11 @@ final class CoreStore: ObservableObject {
             )
             activeSessionId = session.id
             selectedSession = session
-            segmenter = SpeechSegmenterFfi(minSilenceMs: UInt32(max(200, pauseMs)), maxSegmentMs: 15_000)
+            let seg = SpeechSegmenterFfi(minSilenceMs: UInt32(max(200, pauseMs)), maxSegmentMs: 15_000)
+            vadLock.lock()
+            vadSegmenter = seg
+            vadSessionId = session.id
+            vadLock.unlock()
             isCapturing = true
             statusMessage = source == .system ? "正在采集系统音频（Rust VAD + ASR）…" : "正在采集麦克风（Rust VAD + ASR）…"
             audio.start(source: source)
@@ -144,10 +155,14 @@ final class CoreStore: ObservableObject {
         isCapturing = false
         audioLevel = 0
         guard let sid = activeSessionId else { return }
-        if let tail = segmenter?.flush(), !tail.samples.isEmpty {
+        vadLock.lock()
+        let tail = vadSegmenter?.flush()
+        vadSegmenter = nil
+        vadSessionId = nil
+        vadLock.unlock()
+        if let tail, !tail.samples.isEmpty {
             enqueueAudioSegment(tail, sessionId: sid)
         }
-        segmenter = nil
         activeSessionId = nil
         statusMessage = "正在等待尾句转写并提炼核心知识点…"
 
@@ -183,12 +198,18 @@ final class CoreStore: ObservableObject {
         }
     }
 
-    nonisolated private func handleCapturedSamples(_ pcm: [Float]) {
+    /// Runs Rust VAD directly on the background audio capture queue (never wakes @MainActor per frame).
+    nonisolated private func handleCapturedSamplesOffMain(_ pcm: [Float]) {
+        vadLock.lock()
+        let seg = vadSegmenter
+        let sid = vadSessionId
+        vadLock.unlock()
+        guard let seg, let sid else { return }
+        let ready = seg.pushSamples(pcm16k: pcm)
+        guard !ready.isEmpty else { return }
         Task { @MainActor [weak self] in
-            guard let self, let sid = self.activeSessionId, let seg = self.segmenter else { return }
-            let ready = seg.pushSamples(pcm16k: pcm)
             for speech in ready {
-                self.enqueueAudioSegment(speech, sessionId: sid)
+                self?.enqueueAudioSegment(speech, sessionId: sid)
             }
         }
     }

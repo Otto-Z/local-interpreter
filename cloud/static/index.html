@@ -255,29 +255,51 @@
         const res = await fetch('/api/v1/sessions/' + encodeURIComponent(id), { headers: headers() });
         if (res.ok) {
           state.activeSession = await res.json();
+          localStorage.setItem('li_session_' + id, JSON.stringify(state.activeSession));
           render();
+          return;
         }
       } catch (_) {}
+      const cached = localStorage.getItem('li_session_' + id);
+      if (cached) {
+        state.activeSession = JSON.parse(cached);
+        render();
+      } else {
+        const fallback = state.data.sessions.find(s => s.id === id);
+        if (fallback) {
+          state.activeSession = { session: fallback, segments: [], bookmarks: [], questions: [] };
+          render();
+        }
+      }
     }
 
     async function toggleSegBookmark(sessionId, segmentId) {
-      await fetch('/api/v1/bookmarks/toggle', {
-        method: 'POST', headers: headers(),
-        body: JSON.stringify({ session_id: sessionId, segment_id: segmentId, note: 'iPhone 标记' })
-      });
-      await openSession(sessionId);
+      try {
+        const res = await fetch('/api/v1/bookmarks/toggle', {
+          method: 'POST', headers: headers(),
+          body: JSON.stringify({ session_id: sessionId, segment_id: segmentId, note: 'iPhone 标记' })
+        });
+        if (res.ok) await openSession(sessionId);
+      } catch (_) {
+        alert('当前处于离线状态，联网后即可保存书签。');
+      }
     }
 
     async function saveUserNote(sessionId) {
       const val = document.getElementById('noteArea').value;
-      const res = await fetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/note`, {
-        method: 'POST', headers: headers(),
-        body: JSON.stringify({ user_note: val })
-      });
-      if (res.ok) {
-        const btn = document.getElementById('saveNoteBtn');
-        btn.textContent = '✓ 已保存到云端';
-        setTimeout(() => { btn.textContent = '保存笔记（将同步回 Mac / 平板）'; }, 1600);
+      const btn = document.getElementById('saveNoteBtn');
+      try {
+        const res = await fetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/note`, {
+          method: 'POST', headers: headers(),
+          body: JSON.stringify({ user_note: val })
+        });
+        if (res.ok) {
+          btn.textContent = '✓ 已保存到云端';
+          setTimeout(() => { btn.textContent = '保存笔记（将同步回 Mac / 平板）'; }, 1600);
+        }
+      } catch (_) {
+        btn.textContent = '离线无法上传，请联网重试';
+        setTimeout(() => { btn.textContent = '保存笔记（将同步回 Mac / 平板）'; }, 2000);
       }
     }
 

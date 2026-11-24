@@ -72,6 +72,8 @@ pub struct StreamResampler {
     /// Low-pass FIR kernel applied when `in_rate > out_rate` to prevent high-frequency aliasing.
     lpf: Vec<f32>,
     lpf_hist: Vec<f32>,
+    work_buf: Vec<f32>,
+    filtered_buf: Vec<f32>,
     prev_sample: f32,
     has_prev: bool,
 }
@@ -118,6 +120,8 @@ impl StreamResampler {
             phase: 0.0,
             lpf,
             lpf_hist: vec![0.0; hist_len],
+            work_buf: Vec::new(),
+            filtered_buf: Vec::new(),
             prev_sample: 0.0,
             has_prev: false,
         }
@@ -134,6 +138,8 @@ impl StreamResampler {
     pub fn reset(&mut self) {
         self.phase = 0.0;
         self.lpf_hist.fill(0.0);
+        self.work_buf.clear();
+        self.filtered_buf.clear();
         self.prev_sample = 0.0;
         self.has_prev = false;
     }
@@ -147,30 +153,30 @@ impl StreamResampler {
             return input.to_vec();
         }
 
-        // 1. Optional anti-aliasing FIR low-pass when downsampling.
-        let filtered_buf: Vec<f32>;
+        // 1. Optional anti-aliasing FIR low-pass when downsampling (reuses scratch buffers).
         let src: &[f32] = if !self.lpf.is_empty() {
             let taps = self.lpf.len();
             let hist_len = self.lpf_hist.len();
-            let mut work = Vec::with_capacity(hist_len + input.len());
-            work.extend_from_slice(&self.lpf_hist);
-            work.extend_from_slice(input);
+            self.work_buf.clear();
+            self.work_buf.reserve(hist_len + input.len());
+            self.work_buf.extend_from_slice(&self.lpf_hist);
+            self.work_buf.extend_from_slice(input);
 
-            filtered_buf = (0..input.len())
-                .map(|i| {
-                    let mut acc = 0.0f32;
-                    for (k, &coeff) in self.lpf.iter().enumerate() {
-                        acc += work[i + k] * coeff;
-                    }
-                    acc
-                })
-                .collect();
+            self.filtered_buf.clear();
+            self.filtered_buf.reserve(input.len());
+            for i in 0..input.len() {
+                let mut acc = 0.0f32;
+                for (k, &coeff) in self.lpf.iter().enumerate() {
+                    acc += self.work_buf[i + k] * coeff;
+                }
+                self.filtered_buf.push(acc);
+            }
 
             // Save trailing history for the next chunk.
-            let tail_start = work.len() - hist_len;
-            self.lpf_hist.copy_from_slice(&work[tail_start..]);
+            let tail_start = self.work_buf.len() - hist_len;
+            self.lpf_hist.copy_from_slice(&self.work_buf[tail_start..]);
             debug_assert_eq!(taps, hist_len + 1);
-            &filtered_buf
+            &self.filtered_buf
         } else {
             input
         };
@@ -329,9 +335,10 @@ impl<V: VadDetector> SpeechSegmenter<V> {
         let min_silence_samples = (self.cfg.sample_rate as usize * self.cfg.min_silence_ms as usize) / 1000;
         let max_segment_samples = (self.cfg.sample_rate as usize * self.cfg.max_segment_ms as usize) / 1000;
 
-        while self.pending_in.len() >= frame_len {
-            let frame: Vec<f32> = self.pending_in.drain(..frame_len).collect();
-            let prob = self.vad.speech_probability(&frame);
+        let mut offset = 0usize;
+        while offset + frame_len <= self.pending_in.len() {
+            let frame = &self.pending_in[offset..offset + frame_len];
+            let prob = self.vad.speech_probability(frame);
             let is_speech = prob >= self.cfg.speech_threshold;
 
             if !self.in_speech {
@@ -342,9 +349,9 @@ impl<V: VadDetector> SpeechSegmenter<V> {
                     self.speech_start_sample = self.total_samples.saturating_sub(pre_len);
                     self.active_buf.clear();
                     self.active_buf.extend(self.pre_roll.drain(..));
-                    self.active_buf.extend_from_slice(&frame);
+                    self.active_buf.extend_from_slice(frame);
                 } else {
-                    for &s in &frame {
+                    for &s in frame {
                         if self.pre_roll.len() >= self.pre_roll_cap {
                             self.pre_roll.pop_front();
                         }
@@ -352,7 +359,7 @@ impl<V: VadDetector> SpeechSegmenter<V> {
                     }
                 }
             } else {
-                self.active_buf.extend_from_slice(&frame);
+                self.active_buf.extend_from_slice(frame);
                 if is_speech {
                     self.silence_samples = 0;
                 } else {
@@ -382,6 +389,10 @@ impl<V: VadDetector> SpeechSegmenter<V> {
             }
 
             self.total_samples += frame_len as u64;
+            offset += frame_len;
+        }
+        if offset > 0 {
+            self.pending_in.drain(..offset);
         }
 
         emitted

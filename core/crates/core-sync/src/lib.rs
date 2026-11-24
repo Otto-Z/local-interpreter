@@ -306,7 +306,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 impl SyncTransport for GcsS3Transport {
     async fn push(&self, changes: &ChangeSet) -> Result<()> {
         let key = format!(
-            "{}/changes/{}-{}.json",
+            "{}/changes/{:016}-{}.json",
             self.prefix, changes.generated_at, changes.device_id
         );
         let uri = format!("/{}/{}", self.bucket, key.trim_start_matches('/'));

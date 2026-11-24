@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -29,6 +29,7 @@ use flate2::Compression;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
@@ -75,7 +76,7 @@ pub struct AppState {
     http: Client,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct SeqIndex {
     pub latest_seq: i64,
     pub entity_seqs: HashMap<String, i64>,
@@ -98,11 +99,17 @@ impl SeqIndex {
 }
 
 impl AppState {
+    const SEQ_META_KEY: &'static str = "cloud_seq_index";
+
     pub async fn init(cfg: CloudConfig) -> anyhow::Result<Self> {
         let store = match &cfg.db_path {
             Some(path) => Store::open(path, "cloud-server")?,
             None => Store::open_in_memory("cloud-server")?,
         };
+        let initial_seq = store
+            .get_meta(Self::SEQ_META_KEY)?
+            .and_then(|raw| serde_json::from_str::<SeqIndex>(&raw).ok())
+            .unwrap_or_default();
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
@@ -110,7 +117,7 @@ impl AppState {
         let state = Self {
             store,
             cfg,
-            seq_state: Arc::new(Mutex::new(SeqIndex::default())),
+            seq_state: Arc::new(Mutex::new(initial_seq)),
             http,
         };
         // Restore state from GCS if configured (Cloud Run cold start).
@@ -120,6 +127,20 @@ impl AppState {
             }
         }
         Ok(state)
+    }
+
+    async fn persist_state(&self) {
+        if let Ok(json) = {
+            let idx = self.seq_state.lock().await;
+            serde_json::to_string(&*idx)
+        } {
+            if let Err(e) = self.store.set_meta(Self::SEQ_META_KEY, &json) {
+                error!("Failed to persist SeqIndex to SQLite: {e}");
+            }
+        }
+        if let Err(e) = self.persist_to_gcs().await {
+            error!("Failed to persist snapshot to GCS: {e}");
+        }
     }
 
     async fn gcp_access_token(&self) -> anyhow::Result<String> {
@@ -238,6 +259,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/sessions/:id/note", post(update_session_note))
         .route("/api/v1/bookmarks/toggle", post(toggle_bookmark))
         .route("/api/v1/search", get(search_knowledge))
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+        .layer(CompressionLayer::new())
         .layer(cors)
         .with_state(state)
 }
@@ -369,9 +392,7 @@ async fn sync_push(
     };
 
     if report.total_applied() > 0 {
-        if let Err(e) = state.persist_to_gcs().await {
-            error!("Failed to persist snapshot to GCS: {e}");
-        }
+        state.persist_state().await;
     }
 
     Json(PushResponse {
@@ -397,50 +418,60 @@ async fn sync_pull(
         return err.into_response();
     }
 
+    let since = q.since;
+    // Fast O(1) short-circuit when client is already caught up — zero SQLite I/O!
+    let seq_snapshot = {
+        let idx = state.seq_state.lock().await;
+        if since >= idx.latest_seq {
+            let mut empty = ChangeSet::empty("cloud-server", since);
+            empty.server_cursor = Some(idx.latest_seq);
+            return Json(empty).into_response();
+        }
+        idx.clone()
+    };
+
     let all = match state.store.export_changes_since(0) {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    let idx = state.seq_state.lock().await;
-    let since = q.since;
     let mut out = ChangeSet::empty("cloud-server", since);
-    out.server_cursor = Some(idx.latest_seq);
+    out.server_cursor = Some(seq_snapshot.latest_seq);
 
     out.courses = all
         .courses
         .into_iter()
-        .filter(|c| idx.seq_of("course", &c.id) > since)
+        .filter(|c| seq_snapshot.seq_of("course", &c.id) > since)
         .collect();
     out.sessions = all
         .sessions
         .into_iter()
-        .filter(|s| idx.seq_of("session", &s.id) > since)
+        .filter(|s| seq_snapshot.seq_of("session", &s.id) > since)
         .collect();
     out.segments = all
         .segments
         .into_iter()
-        .filter(|s| idx.seq_of("segment", &s.id) > since)
+        .filter(|s| seq_snapshot.seq_of("segment", &s.id) > since)
         .collect();
     out.glossary = all
         .glossary
         .into_iter()
-        .filter(|g| idx.seq_of("glossary", &g.id) > since)
+        .filter(|g| seq_snapshot.seq_of("glossary", &g.id) > since)
         .collect();
     out.questions = all
         .questions
         .into_iter()
-        .filter(|item| idx.seq_of("question", &item.id) > since)
+        .filter(|item| seq_snapshot.seq_of("question", &item.id) > since)
         .collect();
     out.bookmarks = all
         .bookmarks
         .into_iter()
-        .filter(|b| idx.seq_of("bookmark", &b.id) > since)
+        .filter(|b| seq_snapshot.seq_of("bookmark", &b.id) > since)
         .collect();
     out.summaries = all
         .summaries
         .into_iter()
-        .filter(|n| idx.seq_of("summary", &n.id) > since)
+        .filter(|n| seq_snapshot.seq_of("summary", &n.id) > since)
         .collect();
 
     Json(out).into_response()
@@ -528,9 +559,7 @@ async fn update_session_note(
     match state.store.update_session_user_note(&id, &body.user_note) {
         Ok(session) => {
             state.seq_state.lock().await.bump("session", &session.id);
-            if let Err(e) = state.persist_to_gcs().await {
-                error!("GCS persist failed after note update: {e}");
-            }
+            state.persist_state().await;
             Json(session).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -559,9 +588,7 @@ async fn toggle_bookmark(
     {
         Ok((bookmarked, bm)) => {
             state.seq_state.lock().await.bump("bookmark", &bm.id);
-            if let Err(e) = state.persist_to_gcs().await {
-                error!("GCS persist failed after bookmark toggle: {e}");
-            }
+            state.persist_state().await;
             Json(serde_json::json!({ "bookmarked": bookmarked, "bookmark": bm })).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -781,5 +808,53 @@ mod tests {
         // 7. PWA static assets serve properly
         let html = http.get(format!("{base_url}/")).send().await.unwrap().text().await.unwrap();
         assert!(html.contains("apple-mobile-web-app-capable"));
+    }
+
+    #[tokio::test]
+    async fn server_restart_preserves_seq_index_for_incremental_pull() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_file = dir.path().join("cloud.db").to_string_lossy().to_string();
+
+        // Instance 1 receives a course from Mac
+        let cfg1 = CloudConfig {
+            db_path: Some(db_file.clone()),
+            auth_token: "tok".into(),
+            ..CloudConfig::default()
+        };
+        let state1 = AppState::init(cfg1).await.unwrap();
+        let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url1 = format!("http://{}", listener1.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener1, build_router(state1)).await.unwrap();
+        });
+
+        let mac = Store::open_in_memory("mac-1").unwrap();
+        mac.create_course("Persisted Course", "课堂").unwrap();
+        SyncManager::new(mac, CloudRunTransport::new(&url1, "tok"))
+            .sync_now()
+            .await
+            .unwrap();
+
+        // Instance 2 restarts against the SAME SQLite file
+        let cfg2 = CloudConfig {
+            db_path: Some(db_file),
+            auth_token: "tok".into(),
+            ..CloudConfig::default()
+        };
+        let state2 = AppState::init(cfg2).await.unwrap();
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url2 = format!("http://{}", listener2.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener2, build_router(state2)).await.unwrap();
+        });
+
+        // Fresh tablet pulls from restarted instance and MUST receive the persisted course!
+        let tab = Store::open_in_memory("tab-1").unwrap();
+        let st = SyncManager::new(tab.clone(), CloudRunTransport::new(&url2, "tok"))
+            .sync_now()
+            .await
+            .unwrap();
+        assert_eq!(st.pulled_items, 1);
+        assert_eq!(tab.list_courses().unwrap()[0].name, "Persisted Course");
     }
 }

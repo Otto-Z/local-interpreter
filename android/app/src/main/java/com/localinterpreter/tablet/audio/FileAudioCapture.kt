@@ -118,6 +118,7 @@ class FileAudioCapture(
                 val chunkFrames = max(256, sampleRate / 50)
                 val buf = ByteArray(chunkFrames * frameBytes)
                 var leftover = 0
+                val resampler = StreamResampler(sampleRate, 16000)
                 val start = System.currentTimeMillis()
                 var fedSamples = 0L
                 while (running && dataLeft > 0) {
@@ -147,7 +148,7 @@ class FileAudioCapture(
                     if (leftover > 0) {
                         System.arraycopy(buf, consumed, buf, 0, leftover)
                     }
-                    val out = if (sampleRate == 16000) mono else resample(mono, sampleRate, 16000)
+                    val out = resampler.processFloat(mono)
                     if (out.isNotEmpty()) {
                         onFrames(out)
                         fedSamples += frames
@@ -218,6 +219,7 @@ class FileAudioCapture(
             val wallStart = System.currentTimeMillis()
             var firstPtsUs = -1L
             var fedFrames = 0L
+            var resampler = StreamResampler(sampleRate, 16000)
             while (running && !outputDone) {
                 while (paused && running) Thread.sleep(80)
                 if (!running) break
@@ -238,7 +240,11 @@ class FileAudioCapture(
                 when (val outIdx = dec.dequeueOutputBuffer(info, 10_000)) {
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                         val outFmt = dec.outputFormat
-                        sampleRate = outFmt.getInteger(MediaFormat.KEY_SAMPLE_RATE).coerceAtLeast(1)
+                        val newRate = outFmt.getInteger(MediaFormat.KEY_SAMPLE_RATE).coerceAtLeast(1)
+                        if (newRate != sampleRate) {
+                            sampleRate = newRate
+                            resampler = StreamResampler(sampleRate, 16000)
+                        }
                         channels = outFmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT).coerceIn(1, 8)
                         if (outFmt.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
                             encoding = outFmt.getInteger(MediaFormat.KEY_PCM_ENCODING)
@@ -253,7 +259,7 @@ class FileAudioCapture(
                             outBuf.position(info.offset)
                             outBuf.limit(info.offset + info.size)
                             val pcm = decodeToFloat(outBuf, info.size, encoding, channels)
-                            val resampled = if (sampleRate == 16000) pcm else resample(pcm, sampleRate, 16000)
+                            val resampled = resampler.processFloat(pcm)
                             if (resampled.isNotEmpty() && running) {
                                 onFrames(resampled)
                                 if (firstPtsUs < 0 && info.presentationTimeUs >= 0) {
@@ -335,22 +341,6 @@ class FileAudioCapture(
                 }
             }
             out[i] = sum / channels
-        }
-        return out
-    }
-
-    private fun resample(src: FloatArray, from: Int, to: Int): FloatArray {
-        if (src.isEmpty()) return src
-        if (from == to) return src
-        if (from <= 0 || to <= 0) return FloatArray(0)
-        val outLen = (src.size.toLong() * to / from).toInt().coerceAtLeast(1)
-        val out = FloatArray(outLen)
-        for (i in 0 until outLen) {
-            val pos = i.toDouble() * from / to
-            val idx = pos.toInt().coerceIn(0, src.size - 1)
-            val next = (idx + 1).coerceAtMost(src.size - 1)
-            val frac = pos - idx
-            out[i] = (src[idx] * (1 - frac) + src[next] * frac).toFloat()
         }
         return out
     }

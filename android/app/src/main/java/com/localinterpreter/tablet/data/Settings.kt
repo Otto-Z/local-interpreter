@@ -49,6 +49,12 @@ data class SettingsData(
     val liveShowSource: Boolean = true,
     /** 诊断用：开启后在 logcat/日志里打印每句的 Lat 统计行。默认关闭。 */
     val latencyProbe: Boolean = false,
+    /** Google Cloud Run 跨端同步地址（与 Mac / iPhone PWA 共用）。 */
+    val cloudSyncUrl: String = "",
+    /** Google Cloud Run 同步鉴权令牌（SYNC_AUTH_TOKEN）。 */
+    val cloudSyncToken: String = "",
+    /** 下课自动总结后自动同步到 Google Cloud。 */
+    val cloudAutoSync: Boolean = true,
 ) {
     companion object {
         const val MODE_BUILTIN = "builtin"
@@ -136,6 +142,9 @@ class Settings(context: Context) {
             liveFontSize = prefs.getInt("liveFontSize", d.liveFontSize).coerceIn(16, 30),
             liveShowSource = prefs.getBoolean("liveShowSource", d.liveShowSource),
             latencyProbe = prefs.getBoolean("latencyProbe", d.latencyProbe),
+            cloudSyncUrl = prefs.getString("cloudSyncUrl", d.cloudSyncUrl) ?: d.cloudSyncUrl,
+            cloudSyncToken = prefs.getString("cloudSyncToken", d.cloudSyncToken) ?: d.cloudSyncToken,
+            cloudAutoSync = prefs.getBoolean("cloudAutoSync", d.cloudAutoSync),
         )
     }
 
@@ -181,6 +190,9 @@ class Settings(context: Context) {
             .putInt("liveFontSize", next.liveFontSize)
             .putBoolean("liveShowSource", next.liveShowSource)
             .putBoolean("latencyProbe", next.latencyProbe)
+            .putString("cloudSyncUrl", next.cloudSyncUrl)
+            .putString("cloudSyncToken", next.cloudSyncToken)
+            .putBoolean("cloudAutoSync", next.cloudAutoSync)
             .apply()
     }
 

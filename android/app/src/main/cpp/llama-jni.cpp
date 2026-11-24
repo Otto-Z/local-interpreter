@@ -446,8 +446,7 @@ Java_com_localinterpreter_tablet_llm_LlamaNative_generate(
     if (cancelled || rc != 0) {
         if (rc != 0 && !cancelled) LOGE("prompt decode failed: %d", rc);
         // Only preserve cached_tokens up to common_prefix that was already intact before prefill.
-        if (common_prefix > 0) {
-            llama_memory_seq_rm(mem, 0, (llama_pos) common_prefix, -1);
+        if (common_prefix > 0 && llama_memory_seq_rm(mem, 0, (llama_pos) common_prefix, -1)) {
             h->cached_tokens.resize(common_prefix);
         } else {
             h->cached_tokens.clear();
@@ -462,15 +461,17 @@ Java_com_localinterpreter_tablet_llm_LlamaNative_generate(
 
     llama_sampler *smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
     if (temperature <= 0.05f) {
-        // 实时翻译使用确定性贪心解码：跳过 15 万词表全排序/softmax/随机数，既更快又更稳。
+        // 先用 top_k(16) 将候选从 ~15 万词表裁至 16，再做重复惩罚与贪心采样，
+        // 避免 llama_sampler_penalties 对全词表逐 token 做哈希表查找。
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(16));
         llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
                 llama_vocab_n_tokens(vocab), 32, 1.05f, 0.0f, 0.0f));
         llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
     } else {
+        // 先用 top_k(24) 裁掉绝大部分候选，使后续 penalties 与 top_p 只处理 24 个候选。
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(24));
         llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
                 llama_vocab_n_tokens(vocab), 64, 1.05f, 0.0f, 0.0f));
-        // 先用 top_k(24) 裁掉绝大部分候选，把 top_p 排序规模从 ~15 万降到 24。
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(24));
         llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
         llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature));
         llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
@@ -541,9 +542,9 @@ Java_com_localinterpreter_tablet_llm_LlamaNative_generate(
                 LOGE("token decode failed: %d", rc);
             }
             // Keep intact prompt prefix tokens so the next translation still hits KV cache.
-            if (!h->cached_tokens.empty()) {
-                llama_memory_seq_rm(mem, 0, (llama_pos) h->cached_tokens.size(), -1);
-            } else {
+            if (h->cached_tokens.empty() ||
+                !llama_memory_seq_rm(mem, 0, (llama_pos) h->cached_tokens.size(), -1)) {
+                h->cached_tokens.clear();
                 llama_memory_clear(mem, false);
             }
             break;
@@ -577,6 +578,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_localinterpreter_tablet_llm_LlamaNative_destroy(JNIEnv *, jclass, jlong handle) {
     auto *h = reinterpret_cast<LlamaContext *>(handle);
     if (!h) return;
+    h->cancel.store(true, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(h->mutex);
         h->cached_tokens.clear();

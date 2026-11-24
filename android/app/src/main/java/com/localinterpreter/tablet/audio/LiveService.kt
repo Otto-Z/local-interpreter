@@ -312,14 +312,22 @@ class LiveService : Service() {
         }
 
         fun stop(context: Context) {
-            context.startService(Intent(context, LiveService::class.java).setAction(ACTION_STOP))
+            runCatching {
+                context.startService(Intent(context, LiveService::class.java).setAction(ACTION_STOP))
+            }.onFailure {
+                App.instance.live.stop()
+            }
         }
 
         fun togglePause(context: Context, paused: Boolean) {
-            context.startService(
-                Intent(context, LiveService::class.java)
-                    .setAction(if (paused) ACTION_RESUME else ACTION_PAUSE)
-            )
+            runCatching {
+                context.startService(
+                    Intent(context, LiveService::class.java)
+                        .setAction(if (paused) ACTION_RESUME else ACTION_PAUSE)
+                )
+            }.onFailure {
+                if (paused) App.instance.live.resume() else App.instance.live.pause()
+            }
         }
     }
 }

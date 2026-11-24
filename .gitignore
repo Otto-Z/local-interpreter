@@ -44,3 +44,9 @@ data/models/
 
 # sherpa 预编译库的原始压缩包；解压后的 android/vendor/sherpa/jniLibs 已入库
 android/vendor/sherpa-android.tar.bz2
+
+# Rust & macOS SwiftPM 构建产物
+target/
+macos/.build/
+macos/Frameworks/*.xcframework/
+

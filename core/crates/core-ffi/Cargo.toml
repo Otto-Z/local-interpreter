@@ -1,0 +1,26 @@
+[package]
+name = "core-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+name = "local_interpreter_core"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+core-dsp.workspace = true
+core-inference.workspace = true
+core-model.workspace = true
+core-pipeline.workspace = true
+core-storage.workspace = true
+core-sync.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uniffi.workspace = true

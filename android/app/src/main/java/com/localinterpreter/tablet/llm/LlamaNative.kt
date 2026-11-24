@@ -1,12 +1,18 @@
 package com.localinterpreter.tablet.llm
 
+import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.concurrent.read
+import kotlin.concurrent.write
+
 /**
  * Thin JNI bridge to llama.cpp. Each instance owns one model + KV cache.
- * Calls are serialized inside the native layer; [cancel] is safe from another thread.
+ * Calls are serialized inside the native layer; [cancel] is safe from another thread
+ * and [close] waits for any in-flight native call to exit before freeing the handle.
  */
 class LlamaNative private constructor(@Volatile private var handle: Long) {
 
     @Volatile private var closed = false
+    private val rwLock = ReentrantReadWriteLock()
 
     fun interface TokenCallback {
         fun onToken(token: String)
@@ -18,25 +24,28 @@ class LlamaNative private constructor(@Volatile private var handle: Long) {
         maxTokens: Int,
         temperature: Float,
         callback: TokenCallback?,
-    ): String {
+    ): String = rwLock.read {
         val h = handle
-        if (h == 0L) return ""
+        if (closed || h == 0L) return ""
         return generate(h, system, user, maxTokens, temperature, callback)
     }
 
-    @Synchronized
     fun cancel() {
-        val h = handle
-        if (h != 0L) cancel(h)
+        rwLock.read {
+            val h = handle
+            if (h != 0L) cancel(h)
+        }
     }
 
-    @Synchronized
     fun close() {
-        if (closed) return
         closed = true
-        val h = handle
-        handle = 0L
-        if (h != 0L) destroy(h)
+        // 先发取消信号唤醒阻塞中的 generate，再获取写锁等待所有在途 JNI 调用退出后销毁句柄。
+        cancel()
+        rwLock.write {
+            val h = handle
+            handle = 0L
+            if (h != 0L) destroy(h)
+        }
     }
 
     companion object {

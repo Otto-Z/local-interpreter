@@ -30,6 +30,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ExpandLess
@@ -499,14 +501,18 @@ fun SessionDetailPane(
                                         retranslateStatus = "实时同传已开始，补译停止（$done/${todo.size}）"
                                         return@launch
                                     }
+                                    val guessedLang = seg.srcLang.ifBlank {
+                                        com.localinterpreter.tablet.llm.Langs.guessLanguage(seg.srcText).ifBlank { "auto" }
+                                    }
+                                    val temp = if (app.settings.value.llmMode == com.localinterpreter.tablet.data.SettingsData.MODE_API) 0.1f else 0.0f
                                     val out = try {
                                         app.llm.translate(
                                             text = seg.srcText,
-                                            srcLang = seg.srcLang.ifBlank { "auto" },
+                                            srcLang = guessedLang,
                                             target = target,
                                             glossary = glossary,
                                             maxTokens = 320,
-                                            temperature = 0.2f,
+                                            temperature = temp,
                                         ).trim()
                                     } catch (e: Exception) {
                                         retranslateStatus = "补译失败：${e.message?.take(60)}（$done/${todo.size}）"
@@ -520,6 +526,7 @@ fun SessionDetailPane(
                                     }
                                 }
                                 retranslateStatus = "补译完成：$done / ${todo.size}"
+                                Toast.makeText(context, "已补译 $done 句", Toast.LENGTH_SHORT).show()
                             } finally {
                                 retranslating = false
                             }
@@ -671,6 +678,33 @@ fun SessionDetailPane(
                         Spacer(Modifier.weight(1f))
                         IconButton(
                             onClick = {
+                                scope.launch {
+                                    runCatching {
+                                        withContext(Dispatchers.IO) {
+                                            if (isBookmarked) app.db.removeBookmark(sessionId, seg.id)
+                                            else app.db.addBookmark(sessionId, seg.id)
+                                        }
+                                        bookmarks = withContext(Dispatchers.IO) { app.db.listBookmarks(sessionId) }
+                                    }.onSuccess {
+                                        Toast.makeText(
+                                            context,
+                                            if (isBookmarked) "已取消标记" else "已标记该句",
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                    }
+                                }
+                            },
+                            modifier = Modifier.size(28.dp),
+                        ) {
+                            Icon(
+                                if (isBookmarked) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
+                                if (isBookmarked) "取消标记" else "标记该句",
+                                tint = if (isBookmarked) c.accent else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                        IconButton(
+                            onClick = {
                                 copyText(context, "字幕", listOf(seg.srcText, seg.tgtText).filter { it.isNotBlank() }.joinToString("\n"))
                                 Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
                             },
@@ -811,30 +845,32 @@ fun SessionDetailPane(
                 ) { Text("保存", color = c.accent) }
             },
             dismissButton = {
-                TextButton(enabled = !titleBusy, onClick = { titleEdit = null }) { Text("取消") }
-                if (analysisAvailable(app)) {
-                    TextButton(
-                        enabled = !titleBusy,
-                        onClick = {
-                            scope.launch {
-                                titleBusy = true
-                                try {
-                                    val t = assistant.titleFor(sessionId)
-                                    if (t.isNotBlank()) {
-                                        withContext(Dispatchers.IO) { app.db.updateSessionTitle(sessionId, t, "auto") }
-                                        session = session?.copy(title = t)
-                                        tick++
-                                        titleEdit = null
-                                    } else {
-                                        Toast.makeText(context, "AI 未能生成标题，请稍后再试", Toast.LENGTH_SHORT).show()
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TextButton(enabled = !titleBusy, onClick = { titleEdit = null }) { Text("取消") }
+                    if (analysisAvailable(app)) {
+                        TextButton(
+                            enabled = !titleBusy,
+                            onClick = {
+                                scope.launch {
+                                    titleBusy = true
+                                    try {
+                                        val t = assistant.titleFor(sessionId)
+                                        if (t.isNotBlank()) {
+                                            withContext(Dispatchers.IO) { app.db.updateSessionTitle(sessionId, t, "auto") }
+                                            session = session?.copy(title = t)
+                                            tick++
+                                            titleEdit = null
+                                        } else {
+                                            Toast.makeText(context, "AI 未能生成标题，请稍后再试", Toast.LENGTH_SHORT).show()
+                                        }
+                                    } catch (e: Exception) {
+                                        Toast.makeText(context, "生成标题失败：${e.message?.take(60)}", Toast.LENGTH_LONG).show()
                                     }
-                                } catch (e: Exception) {
-                                    Toast.makeText(context, "生成标题失败：${e.message?.take(60)}", Toast.LENGTH_LONG).show()
+                                    titleBusy = false
                                 }
-                                titleBusy = false
-                            }
-                        },
-                    ) { Text(if (titleBusy) "生成中…" else "AI 起标题") }
+                            },
+                        ) { Text(if (titleBusy) "生成中…" else "AI 起标题") }
+                    }
                 }
             },
             containerColor = MaterialTheme.colorScheme.surface,

@@ -515,6 +515,7 @@ private fun CourseDetailPane(
     val scope = rememberCoroutineScope()
     var tab by remember(course.id) { mutableIntStateOf(0) }
     var sessions by remember { mutableStateOf<List<Session>>(emptyList()) }
+    var totalSessionCount by remember(course.id) { mutableIntStateOf(0) }
     var materials by remember { mutableStateOf<List<Material>>(emptyList()) }
     var glossary by remember { mutableStateOf<List<com.localinterpreter.tablet.data.GlossaryItem>>(emptyList()) }
     var sessionQuery by remember(course.id) { mutableStateOf("") }
@@ -522,8 +523,10 @@ private fun CourseDetailPane(
     var q by remember(course.id) { mutableStateOf("") }
     var answer by remember(course.id) { mutableStateOf("") }
     var asking by remember(course.id) { mutableStateOf(false) }
+    var askJob by remember(course.id) { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     var outline by remember(course.id) { mutableStateOf("") }
     var outlineBusy by remember(course.id) { mutableStateOf(false) }
+    var outlineJob by remember(course.id) { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     var glossaryBusy by remember(course.id) { mutableStateOf(false) }
     var term by remember(course.id) { mutableStateOf("") }
     var trans by remember(course.id) { mutableStateOf("") }
@@ -547,6 +550,7 @@ private fun CourseDetailPane(
 
     LaunchedEffect(tick, course.id, tab, sessionQuery) {
         try {
+            totalSessionCount = withContext(Dispatchers.IO) { app.db.courseSessionCount(course.id) }
             if (tab == 0) {
                 sessions = withContext(Dispatchers.IO) { app.db.listSessions(course.id, sessionQuery) }
                 hits = if (sessionQuery.isNotBlank()) {
@@ -565,7 +569,7 @@ private fun CourseDetailPane(
 
     fun submitCourseQuestion() {
         if (q.isNotBlank() && !asking) {
-            scope.launch {
+            askJob = scope.launch {
                 asking = true
                 answer = ""
                 try {
@@ -578,10 +582,13 @@ private fun CourseDetailPane(
                     }
                     if (finalAnswer.isNotBlank()) answer = finalAnswer
                     if (answer.isBlank()) answer = "助教模型未就绪。请在设置 → 翻译与助教中下载助教模型或改用 API。"
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     answer = "失败：${e.message?.take(100) ?: ""}"
+                } finally {
+                    asking = false
                 }
-                asking = false
             }
         }
     }
@@ -607,14 +614,14 @@ private fun CourseDetailPane(
                     }
                 }
                 Text(
-                    "${sessions.size} 个课次 · 更新于 ${formatDate(course.updatedAt)}",
+                    "$totalSessionCount 个课次 · 更新于 ${formatDate(course.updatedAt)}",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
             MiniButton("课前预习", {
                 if (!outlineBusy) {
-                    scope.launch {
+                    outlineJob = scope.launch {
                         outlineBusy = true
                         outline = ""
                         try {
@@ -622,10 +629,13 @@ private fun CourseDetailPane(
                             if (outline.isBlank()) {
                                 outline = "助教模型未就绪或没有生成内容。请在设置中下载助教模型或改用 API。"
                             }
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
                         } catch (e: Exception) {
                             outline = "失败：${e.message?.take(100) ?: ""}"
+                        } finally {
+                            outlineBusy = false
                         }
-                        outlineBusy = false
                     }
                 }
             }, enabled = !outlineBusy, icon = Icons.Default.AutoAwesome)
@@ -683,7 +693,15 @@ private fun CourseDetailPane(
 
         if (answer.isNotBlank() || asking) {
             Spacer(Modifier.height(10.dp))
-            SectionCard(title = "课程问答", trailing = { MiniButton("关闭", { answer = "" }) }) {
+            SectionCard(title = "课程问答", trailing = {
+                MiniButton("关闭", {
+                    askJob?.cancel()
+                    askJob = null
+                    if (asking) app.llm.cancelAssistant()
+                    asking = false
+                    answer = ""
+                })
+            }) {
                 if (asking) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 1.8.dp, color = c.accent)
                 SelectionContainer {
                     Text(
@@ -701,7 +719,15 @@ private fun CourseDetailPane(
         }
         if (outline.isNotBlank() || outlineBusy) {
             Spacer(Modifier.height(10.dp))
-            SectionCard(title = "课前预习大纲", trailing = { MiniButton("关闭", { outline = "" }) }) {
+            SectionCard(title = "课前预习大纲", trailing = {
+                MiniButton("关闭", {
+                    outlineJob?.cancel()
+                    outlineJob = null
+                    if (outlineBusy) app.llm.cancelAssistant()
+                    outlineBusy = false
+                    outline = ""
+                })
+            }) {
                 if (outlineBusy) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 1.8.dp, color = c.accent)
                 SelectionContainer {
                     Text(
@@ -885,15 +911,22 @@ private fun CourseDetailPane(
                                 try {
                                     val pairs = assistant.extractGlossary(course.id)
                                     val existing = glossary.map { it.term }.toSet()
-                                    pairs.filter { it.first !in existing }.forEach {
+                                    val added = pairs.filter { it.first !in existing }
+                                    added.forEach {
                                         withContext(Dispatchers.IO) { app.db.addGlossary(course.id, it.first, it.second) }
                                     }
                                     glossary = withContext(Dispatchers.IO) { app.db.listGlossary(course.id) }
-                                    Toast.makeText(context, "提取了 ${pairs.size} 个术语", Toast.LENGTH_SHORT).show()
+                                    val msg = when {
+                                        pairs.isEmpty() -> "未提取到术语，请确认助教模型已就绪或先导入讲义/记录课次"
+                                        added.isEmpty() -> "识别到 ${pairs.size} 个术语，均已在术语表中"
+                                        else -> "新增 ${added.size} 个术语（共识别 ${pairs.size} 个）"
+                                    }
+                                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
                                 } catch (e: Exception) {
                                     Toast.makeText(context, "提取失败：${e.message?.take(80)}", Toast.LENGTH_LONG).show()
+                                } finally {
+                                    glossaryBusy = false
                                 }
-                                glossaryBusy = false
                             }
                         }
                     }, enabled = !glossaryBusy, icon = Icons.Default.AutoAwesome)

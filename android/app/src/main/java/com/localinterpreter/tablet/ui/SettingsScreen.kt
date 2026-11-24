@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -892,44 +893,165 @@ fun SettingsScreen(
                                     item {
                                         SectionCard(
                                             title = "字幕效果与实时预览",
-                                            subtitle = "拖动下方滑块可实时查看全屏与悬浮字幕显示效果",
+                                            subtitle = "支持左右双栏文字窗分离（条条对应）与自由拖拽边角调节尺寸",
                                             icon = Icons.Default.Subtitles,
                                         ) {
-                                            // 实时字幕预览卡片
+                                            val previewRows = listOf(
+                                                Pair("#1", Pair("Today we'll look at gradient descent.", "今天我们来看梯度下降的原理。")),
+                                                Pair("#2", Pair("Each step moves opposite to the gradient.", "每一步都沿着梯度的反方向更新参数。")),
+                                            ).take(settings.subtitleLines.coerceIn(1, 2))
+                                            val previewSplit = settings.overlayLayout == SettingsData.OVERLAY_LAYOUT_SPLIT && settings.showSource
+                                            val leftW = settings.overlaySplitRatio.coerceIn(0.30f, 0.70f)
+                                            // 实时悬浮字幕预览卡片
                                             Column(
                                                 Modifier
                                                     .fillMaxWidth()
                                                     .clip(RoundedCornerShape(14.dp))
                                                     .background(Color(0xFF0A0D12).copy(alpha = settings.overlayOpacity.coerceIn(0.3f, 1f)))
                                                     .border(1.dp, c.accent.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
-                                                    .padding(horizontal = 18.dp, vertical = 14.dp),
+                                                    .padding(horizontal = 14.dp, vertical = 12.dp),
                                             ) {
                                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                                     Dot(Accent, 7)
-                                                    Text("悬浮 / 全屏字幕预览", color = Color(0xFF8C97A8), fontSize = 11.sp)
+                                                    Text(
+                                                        if (previewSplit) "浮字幕预览 · 左右双栏条条对应" else if (settings.showSource) "浮字幕预览 · 上下逐条卡片" else "浮字幕预览 · 仅译文",
+                                                        color = Color(0xFF8C97A8),
+                                                        fontSize = 11.sp,
+                                                    )
                                                 }
                                                 Spacer(Modifier.height(8.dp))
-                                                if (settings.showSource) {
-                                                    Text(
-                                                        "Today we'll look at how gradient descent optimizes neural networks.",
-                                                        color = Color(0xFF9AA5B6),
-                                                        fontSize = (settings.subtitleSize * 0.42f).coerceIn(11f, 20f).sp,
-                                                        maxLines = 1,
-                                                        overflow = TextOverflow.Ellipsis,
-                                                    )
-                                                    Spacer(Modifier.height(4.dp))
+                                                if (previewSplit) {
+                                                    Row(Modifier.fillMaxWidth().padding(bottom = 4.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                        Text("原文", color = Color(0xFF8FA0B6), fontSize = 10.sp, modifier = Modifier.weight(leftW).padding(start = 6.dp))
+                                                        Text("译文", color = Color(0xFF5EEAD4), fontSize = 10.sp, modifier = Modifier.weight(1f - leftW).padding(start = 6.dp))
+                                                    }
                                                 }
-                                                Text(
-                                                    "今天我们来看梯度下降是如何优化神经网络的。",
-                                                    color = Color(0xFFF2F5F9),
-                                                    fontSize = (settings.subtitleSize * 0.62f).coerceIn(15f, 30f).sp,
-                                                    lineHeight = (settings.subtitleSize * 0.84f).coerceIn(21f, 38f).sp,
-                                                    fontWeight = FontWeight.Medium,
-                                                    maxLines = settings.subtitleLines,
-                                                    overflow = TextOverflow.Ellipsis,
-                                                )
+                                                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                    previewRows.forEachIndexed { idx, (badge, pair) ->
+                                                        val active = idx == previewRows.lastIndex
+                                                        if (previewSplit) {
+                                                            Row(
+                                                                Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+                                                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                                            ) {
+                                                                Column(
+                                                                    Modifier
+                                                                        .weight(leftW)
+                                                                        .fillMaxHeight()
+                                                                        .clip(RoundedCornerShape(10.dp))
+                                                                        .background(if (active) Color(0x20FFFFFF) else Color(0x13FFFFFF))
+                                                                        .border(1.dp, if (active) Color(0x447FA0C4) else Color(0x1EFFFFFF), RoundedCornerShape(10.dp))
+                                                                        .padding(horizontal = 10.dp, vertical = 7.dp),
+                                                                ) {
+                                                                    Text(badge, color = Color(0xFF7E90A8), fontSize = 10.sp)
+                                                                    Text(
+                                                                        pair.first,
+                                                                        color = if (active) Color(0xFFD8E1EE) else Color(0xFFA5B3C6),
+                                                                        fontSize = (settings.subtitleSize * 0.40f).coerceIn(11f, 18f).sp,
+                                                                        lineHeight = (settings.subtitleSize * 0.52f).coerceIn(15f, 24f).sp,
+                                                                    )
+                                                                }
+                                                                Column(
+                                                                    Modifier
+                                                                        .weight(1f - leftW)
+                                                                        .fillMaxHeight()
+                                                                        .clip(RoundedCornerShape(10.dp))
+                                                                        .background(if (active) Color(0x263FE0B0) else Color(0x18FFFFFF))
+                                                                        .border(1.dp, if (active) Color(0x703FE0B0) else Color(0x24FFFFFF), RoundedCornerShape(10.dp))
+                                                                        .padding(horizontal = 10.dp, vertical = 7.dp),
+                                                                ) {
+                                                                    Text("$badge 译文", color = Color(0xFF5EEAD4), fontSize = 10.sp)
+                                                                    Text(
+                                                                        pair.second,
+                                                                        color = if (active) Color.White else Color(0xFFE3EAF4),
+                                                                        fontSize = (settings.subtitleSize * 0.56f).coerceIn(14f, 26f).sp,
+                                                                        lineHeight = (settings.subtitleSize * 0.74f).coerceIn(19f, 34f).sp,
+                                                                        fontWeight = FontWeight.Medium,
+                                                                    )
+                                                                }
+                                                            }
+                                                        } else {
+                                                            Column(
+                                                                Modifier
+                                                                    .fillMaxWidth()
+                                                                    .clip(RoundedCornerShape(10.dp))
+                                                                    .background(if (active) Color(0x223FE0B0) else Color(0x15FFFFFF))
+                                                                    .border(1.dp, if (active) Color(0x663FE0B0) else Color(0x1EFFFFFF), RoundedCornerShape(10.dp))
+                                                                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                                                            ) {
+                                                                if (settings.showSource) {
+                                                                    Text(
+                                                                        "$badge  ${pair.first}",
+                                                                        color = Color(0xFFA5B3C6),
+                                                                        fontSize = (settings.subtitleSize * 0.40f).coerceIn(11f, 18f).sp,
+                                                                    )
+                                                                    HorizontalDivider(Modifier.padding(vertical = 4.dp), color = Color(0x1EFFFFFF))
+                                                                }
+                                                                Text(
+                                                                    pair.second,
+                                                                    color = if (active) Color.White else Color(0xFFE3EAF4),
+                                                                    fontSize = (settings.subtitleSize * 0.58f).coerceIn(14f, 28f).sp,
+                                                                    lineHeight = (settings.subtitleSize * 0.78f).coerceIn(20f, 36f).sp,
+                                                                    fontWeight = FontWeight.Medium,
+                                                                )
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                             Spacer(Modifier.height(12.dp))
+                                            Text("浮字幕文字窗排版", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            Spacer(Modifier.height(6.dp))
+                                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                ChoiceCard(
+                                                    title = "左右双栏对照",
+                                                    subtitle = "左原文 · 右译文 · 条条对齐",
+                                                    selected = settings.overlayLayout == SettingsData.OVERLAY_LAYOUT_SPLIT,
+                                                    modifier = Modifier.weight(1f),
+                                                ) { app.settings.update { it.copy(overlayLayout = SettingsData.OVERLAY_LAYOUT_SPLIT) } }
+                                                ChoiceCard(
+                                                    title = "上下逐条卡片",
+                                                    subtitle = "每句独立成卡 · 适合窄窗",
+                                                    selected = settings.overlayLayout == SettingsData.OVERLAY_LAYOUT_STACK,
+                                                    modifier = Modifier.weight(1f),
+                                                ) { app.settings.update { it.copy(overlayLayout = SettingsData.OVERLAY_LAYOUT_STACK) } }
+                                            }
+                                            Spacer(Modifier.height(8.dp))
+                                            Row(
+                                                Modifier.fillMaxWidth(),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                            ) {
+                                                val geoInfo = if (settings.overlayWidthDp > 0 || settings.overlayHeightDp > 0 || settings.overlayXDp >= 0) {
+                                                    val wText = if (settings.overlayWidthDp > 0) "${settings.overlayWidthDp}dp" else "默认宽"
+                                                    val hText = if (settings.overlayHeightDp > 0) "${settings.overlayHeightDp}dp" else "自动高"
+                                                    "已记住浮窗：$wText × $hText（可拖底角自由缩放，双击底角恢复自动高）"
+                                                } else {
+                                                    "浮窗支持拖动顶栏移位、拖拽左右底角自由调节宽高、拖动中间 ⋮ 调双栏比例"
+                                                }
+                                                Text(
+                                                    geoInfo,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    modifier = Modifier.weight(1f),
+                                                )
+                                                MiniButton(
+                                                    text = "重置位置与尺寸",
+                                                    onClick = {
+                                                        app.settings.update {
+                                                            it.copy(
+                                                                overlayXDp = -1,
+                                                                overlayYDp = -1,
+                                                                overlayWidthDp = 0,
+                                                                overlayHeightDp = 0,
+                                                                overlaySplitRatio = 0.45f,
+                                                            )
+                                                        }
+                                                        toast("已重置浮字幕位置、尺寸与双栏比例")
+                                                    },
+                                                )
+                                            }
+                                            Spacer(Modifier.height(8.dp))
                                             SwitchRow(
                                                 title = "主记录页显示原文（双语模式）",
                                                 subtitle = "关闭后主记录页只展示译文，阅读更专注",
@@ -938,7 +1060,7 @@ fun SettingsScreen(
                                             )
                                             SwitchRow(
                                                 title = "全屏与浮字幕显示原文",
-                                                subtitle = "在译文上方附带一行较小的识别原文",
+                                                subtitle = "开启后与译文条条对应显示；关闭后仅展示译文",
                                                 checked = settings.showSource,
                                                 onChange = { v -> app.settings.update { it.copy(showSource = v) } },
                                             )
@@ -974,8 +1096,8 @@ fun SettingsScreen(
                                                 onChange = { v -> app.settings.update { it.copy(overlayOpacity = v) } },
                                             )
                                             SliderRow(
-                                                title = "全屏 / 浮字幕显示行数",
-                                                valueText = "${settings.subtitleLines} 行",
+                                                title = "全屏 / 浮字幕显示条数",
+                                                valueText = "${settings.subtitleLines} 条",
                                                 value = settings.subtitleLines.toFloat(),
                                                 range = 1f..4f,
                                                 steps = 2,

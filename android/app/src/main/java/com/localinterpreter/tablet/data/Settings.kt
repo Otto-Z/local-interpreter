@@ -55,6 +55,18 @@ data class SettingsData(
     val cloudSyncToken: String = "",
     /** 下课自动总结后自动同步到 Google Cloud。 */
     val cloudAutoSync: Boolean = true,
+    /** 浮字幕布局模式：split（左右双栏对照，条条对应）| stack（上下逐条卡片）。 */
+    val overlayLayout: String = OVERLAY_LAYOUT_SPLIT,
+    /** 双栏浮字幕左原文栏宽度比例（0.30..0.70）。 */
+    val overlaySplitRatio: Float = 0.45f,
+    /** 浮字幕上次保存的左上角 X（dp），< 0 表示未自定义使用默认位置。 */
+    val overlayXDp: Int = -1,
+    /** 浮字幕上次保存的左上角 Y（dp），< 0 表示未自定义使用默认位置。 */
+    val overlayYDp: Int = -1,
+    /** 浮字幕上次保存的宽度（dp），<= 0 表示使用按屏幕计算的默认宽度。 */
+    val overlayWidthDp: Int = 0,
+    /** 浮字幕上次保存的高度（dp），<= 0 表示按内容自适应高度。 */
+    val overlayHeightDp: Int = 0,
 ) {
     companion object {
         const val MODE_BUILTIN = "builtin"
@@ -62,6 +74,8 @@ data class SettingsData(
         const val NOISE_SENSITIVE = "sensitive"
         const val NOISE_STANDARD = "standard"
         const val NOISE_STRICT = "strict"
+        const val OVERLAY_LAYOUT_SPLIT = "split"
+        const val OVERLAY_LAYOUT_STACK = "stack"
     }
 }
 
@@ -145,6 +159,14 @@ class Settings(context: Context) {
             cloudSyncUrl = prefs.getString("cloudSyncUrl", d.cloudSyncUrl) ?: d.cloudSyncUrl,
             cloudSyncToken = prefs.getString("cloudSyncToken", d.cloudSyncToken) ?: d.cloudSyncToken,
             cloudAutoSync = prefs.getBoolean("cloudAutoSync", d.cloudAutoSync),
+            overlayLayout = (prefs.getString("overlayLayout", d.overlayLayout) ?: d.overlayLayout)
+                .takeIf { it == SettingsData.OVERLAY_LAYOUT_SPLIT || it == SettingsData.OVERLAY_LAYOUT_STACK }
+                ?: SettingsData.OVERLAY_LAYOUT_SPLIT,
+            overlaySplitRatio = prefs.getFloat("overlaySplitRatio", d.overlaySplitRatio).coerceIn(0.30f, 0.70f),
+            overlayXDp = prefs.getInt("overlayXDp", d.overlayXDp),
+            overlayYDp = prefs.getInt("overlayYDp", d.overlayYDp),
+            overlayWidthDp = prefs.getInt("overlayWidthDp", d.overlayWidthDp).coerceAtLeast(0),
+            overlayHeightDp = prefs.getInt("overlayHeightDp", d.overlayHeightDp).coerceAtLeast(0),
         )
     }
 
@@ -193,6 +215,12 @@ class Settings(context: Context) {
             .putString("cloudSyncUrl", next.cloudSyncUrl)
             .putString("cloudSyncToken", next.cloudSyncToken)
             .putBoolean("cloudAutoSync", next.cloudAutoSync)
+            .putString("overlayLayout", next.overlayLayout)
+            .putFloat("overlaySplitRatio", next.overlaySplitRatio.coerceIn(0.30f, 0.70f))
+            .putInt("overlayXDp", next.overlayXDp)
+            .putInt("overlayYDp", next.overlayYDp)
+            .putInt("overlayWidthDp", next.overlayWidthDp.coerceAtLeast(0))
+            .putInt("overlayHeightDp", next.overlayHeightDp.coerceAtLeast(0))
             .apply()
     }
 

@@ -1,0 +1,63 @@
+name: Rust Core, Cloud Run & macOS CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "core/**"
+      - "cloud/**"
+      - "macos/**"
+      - "scripts/**"
+      - ".github/workflows/rust-and-macos.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "core/**"
+      - "cloud/**"
+      - "macos/**"
+      - "scripts/**"
+      - ".github/workflows/rust-and-macos.yml"
+  workflow_dispatch:
+
+jobs:
+  rust-core-and-cloud:
+    name: Rust Clippy, Tests & UniFFI Bindings (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run Workspace Unit & Multi-Device E2E Sync Tests
+        run: cargo test --workspace
+      - name: Verify UniFFI Swift & Kotlin Binding Generation
+        run: |
+          cargo build -p core-ffi
+          mkdir -p target/ci-uniffi/swift target/ci-uniffi/kotlin
+          cargo run -p core-ffi --bin uniffi-bindgen -- generate \
+            --library target/debug/liblocal_interpreter_core.so \
+            --language swift --out-dir target/ci-uniffi/swift
+          cargo run -p core-ffi --bin uniffi-bindgen -- generate \
+            --library target/debug/liblocal_interpreter_core.so \
+            --language kotlin --out-dir target/ci-uniffi/kotlin
+
+  macos-app-build:
+    name: macOS XCFramework & SwiftUI Build (Apple Silicon)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build XCFramework & Swift UniFFI Bindings
+        run: ./scripts/build_macos_core.sh
+      - name: Build macOS SwiftUI App
+        working-directory: macos
+        run: swift build -c release

@@ -43,14 +43,14 @@ pub fn recommended_models() -> Vec<ModelSpec> {
             description: "主力离线同传翻译模型：低延迟、中英互译自然、显存占用低".into(),
         },
         ModelSpec {
-            id: "qwen2.5-3b-q4".into(),
-            name: "Qwen2.5 3B Instruct (Q4_K_M)".into(),
+            id: "qwen3-4b-q4".into(),
+            name: "Qwen3 4B Instruct (Q4_K_M)".into(),
             role: "assistant".into(),
-            filename: "qwen2.5-3b-instruct-q4_k_m.gguf".into(),
-            repo_path: "Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf"
+            filename: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf".into(),
+            repo_path: "unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
                 .into(),
-            approx_size_mb: 1930,
-            description: "课堂助教与知识点提炼模型：总结、答疑、术语提取与出复习题".into(),
+            approx_size_mb: 2497,
+            description: "课堂助教与知识点提炼模型（Apache-2.0）：总结、答疑、术语提取与出复习题".into(),
         },
         ModelSpec {
             id: "whisper-large-v3-turbo-q5".into(),

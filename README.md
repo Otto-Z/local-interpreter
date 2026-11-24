@@ -207,3 +207,10 @@ LITE=1 bash build_app.sh   # 生成不带助教模型的 dist/本地同传-2.2.3
 ## 说话人区分
 
 本地 CAM++ 声纹模型（约 27MB，随应用提供）对每段音频做嵌入和在线聚类，字幕会标出「说话人 1 / 2…」，历史详情里可重命名成「老师」「同学 A」。两人交替说话的场景实测可正确区分；多人抢话或音色接近时可能出错，可在设置里关闭。
+
+## 开源协议与第三方声明
+
+- 本项目源码采用 [Apache License 2.0](./LICENSE) 开源。
+- 随仓库或运行时使用的第三方组件与模型（`llama.cpp`、`sherpa-onnx`、`Silero VAD`、`3D-Speaker CAM++`、`Hy-MT2`、`Qwen3`、`SenseVoice`、`whisper.cpp`、`pypdf` 等）均各自遵循其开源协议，详见 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)。
+- `android/app/localinterpreter.jks` 为公开社区构建签名密钥；独立或正式分发请通过环境变量 `ANDROID_KEYSTORE_PATH` / `ANDROID_KEYSTORE_PASSWORD` / `ANDROID_KEY_ALIAS` / `ANDROID_KEY_PASSWORD` 注入私有签名。
+

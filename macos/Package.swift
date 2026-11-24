@@ -22,7 +22,13 @@ let package = Package(
         .executableTarget(
             name: "LocalInterpreterMac",
             dependencies: ["LocalInterpreterCoreBindings"],
-            path: "Sources/LocalInterpreterMac"
+            path: "Sources/LocalInterpreterMac",
+            linkerSettings: [
+                .linkedFramework("Security"),
+                .linkedFramework("SystemConfiguration"),
+                .linkedLibrary("z"),
+                .linkedLibrary("iconv"),
+            ]
         ),
     ]
 )

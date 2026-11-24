@@ -6,12 +6,15 @@ use core_dsp::{
     rms_level, AdaptiveEnergyVad, SegmenterConfig, SpeechSegment, SpeechSegmenter,
     StreamResampler, TARGET_SAMPLE_RATE,
 };
+use core_inference::models::{ModelDownloader, ModelStatus};
 use core_inference::{AsrEngine, Langs, OpenAiCompatClient, OpenAiWhisperAsrClient, ThinkFilter};
 use core_model::{
     Bookmark, Course, GlossaryEntry, KnowledgePoint, Question, SearchHit, Segment, Session,
+    SummaryNote,
 };
 use core_pipeline::{export_session_markdown, looks_like_question, PipelineCoordinator};
 use core_storage::legacy::import_legacy_db;
+use core_storage::materials::CourseMaterial;
 use core_storage::Store;
 use core_sync::{CloudRunTransport, FolderTransport, GcsS3Transport, SyncManager, SyncStats};
 use thiserror::Error;
@@ -114,6 +117,7 @@ pub struct FfiSession {
     pub summary: String,
     pub knowledge_points: Vec<FfiKnowledgePoint>,
     pub user_note: String,
+    pub quiz: String,
     pub status: String,
     pub updated_at: i64,
 }
@@ -133,6 +137,7 @@ impl From<Session> for FfiSession {
             summary: s.summary,
             knowledge_points: s.knowledge_points.into_iter().map(Into::into).collect(),
             user_note: s.user_note,
+            quiz: s.quiz,
             status: s.status,
             updated_at: s.updated_at,
         }
@@ -291,6 +296,83 @@ pub struct FfiMigrationSummary {
     pub segments: u64,
     pub glossary: u64,
     pub bookmarks: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSummaryNote {
+    pub id: String,
+    pub session_id: String,
+    pub content: String,
+    pub created_at: i64,
+}
+
+impl From<SummaryNote> for FfiSummaryNote {
+    fn from(n: SummaryNote) -> Self {
+        Self {
+            id: n.id,
+            session_id: n.session_id,
+            content: n.content,
+            created_at: n.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiMaterialPage {
+    pub page: u32,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiMaterial {
+    pub id: String,
+    pub course_id: String,
+    pub name: String,
+    pub path: String,
+    pub page_count: u32,
+    pub created_at: i64,
+}
+
+impl From<CourseMaterial> for FfiMaterial {
+    fn from(m: CourseMaterial) -> Self {
+        Self {
+            id: m.id,
+            course_id: m.course_id,
+            name: m.name,
+            path: m.path,
+            page_count: m.page_count,
+            created_at: m.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiModelStatus {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub filename: String,
+    pub approx_size_mb: u64,
+    pub description: String,
+    pub local_path: String,
+    pub downloaded_bytes: u64,
+    pub is_ready: bool,
+}
+
+impl From<ModelStatus> for FfiModelStatus {
+    fn from(m: ModelStatus) -> Self {
+        Self {
+            id: m.spec.id,
+            name: m.spec.name,
+            role: m.spec.role,
+            filename: m.spec.filename,
+            approx_size_mb: m.spec.approx_size_mb,
+            description: m.spec.description,
+            local_path: m.local_path,
+            downloaded_bytes: m.downloaded_bytes,
+            is_ready: m.is_ready,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------- Stateless helpers
@@ -772,6 +854,164 @@ impl InterpreterCore {
         );
         let stats = self.rt.block_on(mgr.sync_now())?;
         Ok(stats.into())
+    }
+
+    // ------------------------------------------------------------------ Course Materials (PDF/Slides)
+
+    pub fn add_material_pages(
+        &self,
+        course_id: String,
+        name: String,
+        path: String,
+        pages: Vec<FfiMaterialPage>,
+    ) -> Result<FfiMaterial, CoreError> {
+        let pairs: Vec<(u32, String)> = pages.into_iter().map(|p| (p.page, p.text)).collect();
+        Ok(self
+            .store
+            .add_material_pages(&course_id, &name, &path, &pairs)?
+            .into())
+    }
+
+    pub fn list_materials(&self, course_id: String) -> Result<Vec<FfiMaterial>, CoreError> {
+        Ok(self
+            .store
+            .list_materials(&course_id)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    pub fn delete_material(&self, material_id: String) -> Result<(), CoreError> {
+        self.store.delete_material(&material_id)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ Live Classroom Assistant
+
+    pub fn list_summary_notes(&self, session_id: String) -> Result<Vec<FfiSummaryNote>, CoreError> {
+        Ok(self
+            .store
+            .list_summary_notes(&session_id)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Summarize the last `minutes` of a session in plain Chinese and persist it.
+    pub fn recap_recent_minutes(
+        &self,
+        endpoint: FfiLlmEndpoint,
+        session_id: String,
+        minutes: u32,
+    ) -> Result<FfiSummaryNote, CoreError> {
+        let client = Arc::new(OpenAiCompatClient::new(
+            endpoint.base_url,
+            endpoint.api_key,
+            endpoint.model,
+        ));
+        let pipe = PipelineCoordinator::new(self.store.clone(), client.clone(), client);
+        let note =
+            self.rt
+                .block_on(pipe.recap_recent(&session_id, minutes, CancellationToken::new()))?;
+        Ok(note.into())
+    }
+
+    /// Answer a live/review question grounded in recent transcript + uploaded course slides.
+    pub fn ask_assistant_question(
+        &self,
+        endpoint: FfiLlmEndpoint,
+        session_id: String,
+        course_id: Option<String>,
+        question: String,
+        segment_id: Option<String>,
+        source_tag: String,
+    ) -> Result<FfiQuestion, CoreError> {
+        let client = Arc::new(OpenAiCompatClient::new(
+            endpoint.base_url,
+            endpoint.api_key,
+            endpoint.model,
+        ));
+        let pipe = PipelineCoordinator::new(self.store.clone(), client.clone(), client);
+        let q = self.rt.block_on(pipe.answer_question(
+            &session_id,
+            course_id.as_deref(),
+            &question,
+            segment_id,
+            &source_tag,
+            CancellationToken::new(),
+        ))?;
+        Ok(q.into())
+    }
+
+    /// Generate 5 post-class review quiz questions and store on the session (syncs to iPhone PWA).
+    pub fn generate_session_quiz(
+        &self,
+        endpoint: FfiLlmEndpoint,
+        session_id: String,
+    ) -> Result<FfiSession, CoreError> {
+        let client = Arc::new(OpenAiCompatClient::new(
+            endpoint.base_url,
+            endpoint.api_key,
+            endpoint.model,
+        ));
+        let pipe = PipelineCoordinator::new(self.store.clone(), client.clone(), client);
+        let session = self
+            .rt
+            .block_on(pipe.generate_session_quiz(&session_id, CancellationToken::new()))?;
+        Ok(session.into())
+    }
+
+    /// Generate a pre-class study outline from uploaded course slides.
+    pub fn generate_course_outline(
+        &self,
+        endpoint: FfiLlmEndpoint,
+        course_id: String,
+    ) -> Result<FfiCourse, CoreError> {
+        let client = Arc::new(OpenAiCompatClient::new(
+            endpoint.base_url,
+            endpoint.api_key,
+            endpoint.model,
+        ));
+        let pipe = PipelineCoordinator::new(self.store.clone(), client.clone(), client);
+        let course = self
+            .rt
+            .block_on(pipe.generate_course_outline(&course_id, CancellationToken::new()))?;
+        Ok(course.into())
+    }
+
+    // ------------------------------------------------------------------ Offline Model Manager
+
+    pub fn list_offline_models(&self, models_dir: String) -> Vec<FfiModelStatus> {
+        ModelDownloader::new(models_dir)
+            .list_status()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    pub fn download_offline_model(
+        &self,
+        models_dir: String,
+        model_id: String,
+        use_hf_mirror: bool,
+    ) -> Result<String, CoreError> {
+        let dl = ModelDownloader::new(models_dir);
+        let path = self
+            .rt
+            .block_on(dl.download_by_id(
+                &model_id,
+                use_hf_mirror,
+                CancellationToken::new(),
+                |_, _| {},
+            ))
+            .map_err(|e| CoreError::Inference { msg: e.to_string() })?;
+        Ok(path.to_string_lossy().to_string())
+    }
+
+    pub fn delete_offline_model(&self, models_dir: String, model_id: String) -> Result<bool, CoreError> {
+        ModelDownloader::new(models_dir)
+            .delete_model(&model_id)
+            .map_err(|e| CoreError::Inference { msg: e.to_string() })
     }
 }
 

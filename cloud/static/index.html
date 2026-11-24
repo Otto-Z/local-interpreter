@@ -357,6 +357,26 @@
           <textarea id="noteArea" placeholder="在手机上补充复习要点，下次 Mac / 平板同步时自动带回…">${esc(s.user_note || '')}</textarea>
           <button id="saveNoteBtn" class="btn primary" style="margin-top:8px;width:100%;" onclick="saveUserNote('${esc(s.id)}')">保存笔记（将同步回 Mac / 平板）</button>
         </div>
+        ${(d.questions || []).length ? `
+          <div class="card">
+            <div class="card-title">💡 课堂助教问答（${d.questions.length}）</div>
+            ${d.questions.map(q => `
+              <div class="seg-item">
+                <div class="card-title" style="font-size:14.5px;margin-bottom:4px;">Q：${esc(q.question)}</div>
+                <div class="body">${esc(q.answer)}</div>
+              </div>
+            `).join('')}
+          </div>
+        ` : ''}
+        ${s.quiz ? `
+          <div class="card">
+            <div class="card-title">🎯 课后自测复习题</div>
+            <details>
+              <summary style="cursor:pointer;color:var(--accent);font-size:14px;font-weight:600;margin-bottom:8px;">展开自测题与参考答案</summary>
+              <div class="body" style="margin-top:8px;">${esc(s.quiz)}</div>
+            </details>
+          </div>
+        ` : ''}
         ${(d.segments || []).length ? `
           <div class="card">
             <div class="card-title">双语转录（点击 ☆ 收藏重点句）</div>

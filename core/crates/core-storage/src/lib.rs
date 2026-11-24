@@ -2,6 +2,7 @@
 //! deterministic multi-device ChangeSet sync, and legacy macOS/Android DB migration.
 
 pub mod legacy;
+pub mod materials;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -319,6 +320,28 @@ impl Store {
         session.device_id = self.device_id.clone();
         self.upsert_session(&session)?;
         Ok(session)
+    }
+
+    pub fn update_session_quiz(&self, session_id: &str, quiz: &str) -> Result<Session> {
+        let mut session = self
+            .get_session(session_id)?
+            .ok_or_else(|| StorageError::NotFound(format!("session {session_id}")))?;
+        session.quiz = quiz.trim().to_string();
+        session.updated_at = now_ms().max(session.updated_at + 1);
+        session.device_id = self.device_id.clone();
+        self.upsert_session(&session)?;
+        Ok(session)
+    }
+
+    pub fn update_course_outline(&self, course_id: &str, outline: &str) -> Result<Course> {
+        let mut course = self
+            .get_course(course_id)?
+            .ok_or_else(|| StorageError::NotFound(format!("course {course_id}")))?;
+        course.outline = outline.trim().to_string();
+        course.updated_at = now_ms().max(course.updated_at + 1);
+        course.device_id = self.device_id.clone();
+        self.upsert_course(&course)?;
+        Ok(course)
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
@@ -1387,9 +1410,28 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_questions_session ON questions(session_id);
         CREATE INDEX IF NOT EXISTS idx_questions_updated ON questions(updated_at);
         CREATE INDEX IF NOT EXISTS idx_bookmarks_session ON bookmarks(session_id, segment_id);
+        CREATE TABLE IF NOT EXISTS materials (
+            id TEXT PRIMARY KEY,
+            course_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            path TEXT NOT NULL DEFAULT '',
+            page_count INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS material_chunks (
+            id TEXT PRIMARY KEY,
+            material_id TEXT NOT NULL,
+            course_id TEXT NOT NULL,
+            page INTEGER NOT NULL DEFAULT 1,
+            text TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_bookmarks_updated ON bookmarks(updated_at);
         CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id);
         CREATE INDEX IF NOT EXISTS idx_summaries_updated ON summaries(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_materials_course ON materials(course_id);
+        CREATE INDEX IF NOT EXISTS idx_material_chunks_course ON material_chunks(course_id, page);
         ",
     )?;
     // Optional FTS5 table for accelerated search when supported by bundled SQLite.

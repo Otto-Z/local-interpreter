@@ -49,6 +49,7 @@ jobs:
 
   macos-app-build:
     name: macOS XCFramework & SwiftUI Build (Apple Silicon)
+    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4

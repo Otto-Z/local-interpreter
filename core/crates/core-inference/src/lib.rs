@@ -3,6 +3,9 @@
 //! - Thinking-model `<think>` full & streaming tag filters
 //! - Translation, Knowledge Point extraction, Recap, Glossary, and Q&A prompt builders
 //! - Pooled OpenAI-compatible SSE streaming client with bounded buffers & cancellation
+//! - Resumable GGUF / Whisper offline model catalog & downloader
+
+pub mod models;
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -315,6 +318,54 @@ impl PromptBuilder {
     pub fn question_answer_messages(question: &str, context: &str) -> Vec<ChatMessage> {
         let sys = "你是课堂实时助教。结合近期课堂语境，用 2~4 句准确、易懂的中文回答老师或学生提出的问题。";
         let user = format!("课堂语境：\n{context}\n\n问题：{question}");
+        vec![ChatMessage::system(sys), ChatMessage::user(user)]
+    }
+
+    pub fn qa_with_slides_messages(
+        question: &str,
+        transcript_context: &str,
+        slide_snippets: &str,
+    ) -> Vec<ChatMessage> {
+        let sys = "你是课堂实时助教。优先结合课堂记录与课件片段用 3~5 句清晰中文回答问题；\
+                   若引用了课件片段，请在回答中注明「课件第 X 页」。不知道就诚实说明。";
+        let mut user = String::new();
+        if !slide_snippets.trim().is_empty() {
+            user.push_str("相关课件片段：\n");
+            user.push_str(slide_snippets.trim());
+            user.push_str("\n\n");
+        }
+        if !transcript_context.trim().is_empty() {
+            user.push_str("近期课堂记录：\n");
+            user.push_str(transcript_context.trim());
+            user.push_str("\n\n");
+        }
+        user.push_str("问题：");
+        user.push_str(question.trim());
+        vec![ChatMessage::system(sys), ChatMessage::user(user)]
+    }
+
+    pub fn recap_messages(recent_transcript: &str, minutes: u32) -> Vec<ChatMessage> {
+        let sys = format!(
+            "你是课堂助教。请用通俗易懂的中文总结最近约 {minutes} 分钟的课堂重点：\
+             输出 3~5 条要点（每行以「- 」开头），涉及关键概念用一句大白话解释。不要提「字幕」「转录」。"
+        );
+        vec![
+            ChatMessage::system(sys),
+            ChatMessage::user(recent_transcript.to_string()),
+        ]
+    }
+
+    pub fn quiz_messages(transcript: &str, course_name: &str) -> Vec<ChatMessage> {
+        let sys = "你是课堂复习助教。根据本节课堂内容出 5 道高质量课后自测题（概念辨析/理解应用为主）。\
+                   每道题格式：\n1. 题目内容\n答：简明参考答案\n用中文输出，条理清晰。";
+        let user = format!("课程：{course_name}\n\n课堂内容：\n{transcript}");
+        vec![ChatMessage::system(sys), ChatMessage::user(user)]
+    }
+
+    pub fn course_outline_messages(material_text: &str, course_name: &str) -> Vec<ChatMessage> {
+        let sys = "你是课程助教。请根据课件与讲义生成一份课前预习提纲：\
+                   包含 4~6 条核心章节要点，以及 3 个值得带着听课思考的问题。用中文，结构清晰。";
+        let user = format!("课程：{course_name}\n\n课件摘录：\n{material_text}");
         vec![ChatMessage::system(sys), ChatMessage::user(user)]
     }
 }

@@ -11,22 +11,24 @@ struct LocalInterpreterMacApp: App {
         WindowGroup("离线同传 · macOS") {
             MainShellView()
                 .environmentObject(store)
-                .frame(minWidth: 960, minHeight: 640)
+                .frame(minWidth: 1040, minHeight: 680)
         }
     }
 }
 
 enum SidebarTab: String, CaseIterable, Identifiable {
     case live = "实时同传"
-    case knowledge = "知识点库"
+    case knowledge = "知识点 & 自测"
+    case materials = "课件 & 预习"
     case glossary = "课程术语"
-    case sync = "云同步 & 设置"
+    case sync = "模型 & 云同步"
 
     var id: String { rawValue }
     var icon: String {
         switch self {
         case .live: return "waveform"
         case .knowledge: return "sparkles"
+        case .materials: return "doc.text.magnifyingglass"
         case .glossary: return "book.closed"
         case .sync: return "icloud.and.arrow.up"
         }
@@ -41,7 +43,7 @@ struct MainShellView: View {
     var body: some View {
         NavigationSplitView {
             List(selection: $tab) {
-                Section("导航") {
+                Section("工作区") {
                     ForEach(SidebarTab.allCases) { item in
                         Label(item.rawValue, systemImage: item.icon).tag(item)
                     }
@@ -80,6 +82,8 @@ struct MainShellView: View {
                     LiveInterpreterView()
                 case .knowledge:
                     KnowledgeLibraryView()
+                case .materials:
+                    MaterialsAndOutlineView()
                 case .glossary:
                     GlossaryView()
                 case .sync:
@@ -106,52 +110,115 @@ struct MainShellView: View {
 
 struct LiveInterpreterView: View {
     @EnvironmentObject var store: CoreStore
+    @State private var askInput = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 10) {
-                if !store.isCapturing {
-                    Button("开始内录系统声音") { store.startLiveSession(source: .system) }
-                        .buttonStyle(.borderedProminent)
-                    Button("开始麦克风同传") { store.startLiveSession(source: .mic) }
+        HSplitView {
+            // Left: Live controls & bilingual transcript
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    if !store.isCapturing {
+                        Button("开始内录系统声音") { store.startLiveSession(source: .system) }
+                            .buttonStyle(.borderedProminent)
+                        Button("开始麦克风同传") { store.startLiveSession(source: .mic) }
+                            .buttonStyle(.bordered)
+                    } else {
+                        Button("下课并提炼知识点") { store.stopLiveSessionAndFinalize() }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.red)
+                    }
+                    Button("悬浮字幕窗") { store.toggleOverlay() }
                         .buttonStyle(.bordered)
-                } else {
-                    Button("下课并提炼知识点") { store.stopLiveSessionAndFinalize() }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.red)
+                    Spacer()
+                    ProgressView(value: Double(min(1.0, store.audioLevel * 4.0)))
+                        .frame(width: 80)
+                    Text("\(displayLanguageName(code: store.sourceLang)) → \(displayLanguageName(code: store.targetLang))")
+                        .font(.caption.monospaced())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(.quaternary, in: Capsule())
                 }
-                Button("悬浮字幕窗") { store.toggleOverlay() }
-                    .buttonStyle(.bordered)
-                Spacer()
-                ProgressView(value: Double(min(1.0, store.audioLevel * 4.0)))
-                    .frame(width: 90)
-                Text("\(displayLanguageName(code: store.sourceLang)) → \(displayLanguageName(code: store.targetLang))")
-                    .font(.caption.monospaced())
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(.quaternary, in: Capsule())
-            }
-            .padding(.horizontal)
-            .padding(.top, 12)
+                .padding(.horizontal)
+                .padding(.top, 12)
 
-            List(store.segments, id: \.id) { seg in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text(seg.srcText).font(.subheadline).foregroundStyle(.secondary)
-                        Spacer()
-                        if let sid = store.selectedSession?.id {
-                            Button {
-                                store.toggleBookmark(sessionId: sid, segmentId: seg.id)
-                            } label: {
-                                Image(systemName: store.bookmarks.contains(seg.id) ? "bookmark.fill" : "bookmark")
+                List(store.segments, id: \.id) { seg in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(seg.srcText).font(.subheadline).foregroundStyle(.secondary)
+                            Spacer()
+                            if let sid = store.selectedSession?.id {
+                                Button {
+                                    store.toggleBookmark(sessionId: sid, segmentId: seg.id)
+                                } label: {
+                                    Image(systemName: store.bookmarks.contains(seg.id) ? "bookmark.fill" : "bookmark")
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
+                        }
+                        Text(seg.tgtText).font(.body.weight(.medium))
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+            .frame(minWidth: 500)
+
+            // Right: Live Classroom Assistant (5-min recap + slide-grounded Q&A)
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Label("课堂助教", systemImage: "brain")
+                        .font(.headline)
+                    Spacer()
+                    Button("总结近 5 分钟") { store.recapLast5Minutes() }
+                        .disabled(store.assistantBusy || store.segments.isEmpty)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+                Toggle("自动捕获课堂提问并秒答", isOn: $store.autoDetectQuestions)
+                    .font(.caption)
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(store.summaryNotes, id: \.id) { note in
+                            GroupBox("阶段总结") {
+                                Text(note.content)
+                                    .font(.callout)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        ForEach(store.questions, id: \.id) { q in
+                            GroupBox("Q: \(q.question)") {
+                                Text(q.answer)
+                                    .font(.callout)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        if store.summaryNotes.isEmpty && store.questions.isEmpty {
+                            Text("上课过程中可随时点「总结近 5 分钟」，或在下方提问（自动检索已导入的 PDF 课件）。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(.top, 20)
                         }
                     }
-                    Text(seg.tgtText).font(.body.weight(.medium))
                 }
-                .padding(.vertical, 4)
+
+                HStack {
+                    TextField("向助教提问（自动结合课堂与课件）…", text: $askInput)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit {
+                            let q = askInput
+                            askInput = ""
+                            store.askAssistant(question: q)
+                        }
+                    Button("发送") {
+                        let q = askInput
+                        askInput = ""
+                        store.askAssistant(question: q)
+                    }
+                    .disabled(store.assistantBusy || askInput.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
             }
+            .padding(12)
+            .frame(minWidth: 300, maxWidth: 380)
         }
     }
 }
@@ -193,6 +260,8 @@ struct KnowledgeLibraryView: View {
                         HStack {
                             Text(s.title.isEmpty ? "未命名课次" : s.title).font(.title2.bold())
                             Spacer()
+                            Button("生成 5 道复习题") { store.generateQuizForSelectedSession() }
+                                .disabled(store.assistantBusy)
                             Button("复制 Markdown") {
                                 let md = store.exportMarkdown(sessionId: s.id)
                                 NSPasteboard.general.clearContents()
@@ -230,13 +299,78 @@ struct KnowledgeLibraryView: View {
                                 }
                             }
                         }
+                        if !s.quiz.isEmpty {
+                            GroupBox("课后复习自测题（已同步至 iPhone）") {
+                                Text(s.quiz).frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
                     }
                     .padding(16)
                 } else {
-                    Text("从左侧选择一节课查看知识点与双语总结")
+                    Text("从左侧选择一节课查看知识点、复习题与双语总结")
                         .foregroundStyle(.secondary)
                         .padding(40)
                 }
+            }
+        }
+    }
+}
+
+struct MaterialsAndOutlineView: View {
+    @EnvironmentObject var store: CoreStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text(store.selectedCourse?.name ?? "请先在左侧选择一门课程")
+                    .font(.title2.bold())
+                Spacer()
+                Button("导入 PDF / Markdown 课件") {
+                    let panel = NSOpenPanel()
+                    panel.allowedContentTypes = [.pdf, .plainText, .data]
+                    panel.allowsMultipleSelection = false
+                    if panel.runModal() == .OK, let url = panel.url {
+                        store.importCourseMaterial(url: url)
+                    }
+                }
+                .disabled(store.selectedCourseId == nil)
+                .buttonStyle(.borderedProminent)
+
+                Button("生成课前预习提纲") {
+                    store.generateOutlineForSelectedCourse()
+                }
+                .disabled(store.selectedCourseId == nil || store.materials.isEmpty || store.assistantBusy)
+                .buttonStyle(.bordered)
+            }
+            .padding(.horizontal)
+            .padding(.top, 14)
+
+            if let outline = store.selectedCourse?.outline, !outline.isEmpty {
+                GroupBox("课前预习提纲") {
+                    ScrollView {
+                        Text(outline)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 200)
+                }
+                .padding(.horizontal)
+            }
+
+            List(store.materials, id: \.id) { mat in
+                HStack {
+                    Image(systemName: "doc.richtext")
+                    VStack(alignment: .leading) {
+                        Text(mat.name).font(.headline)
+                        Text("已索引 \(mat.pageCount) 页 · 上课答疑自动引用页码")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("删除", role: .destructive) {
+                        store.deleteMaterial(mat.id)
+                    }
+                }
+                .padding(.vertical, 4)
             }
         }
     }
@@ -288,7 +422,47 @@ struct SyncAndSettingsView: View {
                 }
             }
 
-            Section("语音识别 & 翻译引擎（本地 whisper-server / llama-server / OpenAI 兼容）") {
+            Section("离线模型一键下载 & 本机 Metal 引擎") {
+                Toggle("优先使用国内镜像（hf-mirror.com）", isOn: $store.useHfMirror)
+                ForEach(store.offlineModels, id: \.id) { model in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(model.name) · 约 \(model.approxSizeMb) MB")
+                                .font(.headline)
+                            Text(model.description)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if model.isReady {
+                            Label("已就绪", systemImage: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                                .font(.caption)
+                            Button("删除", role: .destructive) { store.deleteModel(id: model.id) }
+                                .controlSize(.small)
+                        } else if store.downloadingModelId == model.id {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Button("下载") { store.downloadModel(id: model.id) }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+                HStack {
+                    Button("一键拉起本机 llama-server / whisper-server (Metal)") {
+                        store.launchLocalOfflineServers()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button("检测引擎连接") { Task { await store.probeLocalEngines() } }
+                    if !store.engineStatusText.isEmpty {
+                        Text(store.engineStatusText).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            Section("语音识别 & 翻译引擎自定义地址") {
                 TextField("ASR 地址 (whisper-server / SenseVoice)", text: $store.asrBaseUrl)
                 TextField("ASR 模型", text: $store.asrModel)
                 SecureField("ASR API Key（本地留空）", text: $store.asrApiKey)
@@ -296,12 +470,6 @@ struct SyncAndSettingsView: View {
                 TextField("LLM 地址 (llama-server / MLX / OpenAI)", text: $store.llmBaseUrl)
                 TextField("LLM 模型", text: $store.llmModel)
                 SecureField("LLM API Key（本地留空）", text: $store.llmApiKey)
-                HStack {
-                    Button("检测引擎连接") { Task { await store.probeLocalEngines() } }
-                    if !store.engineStatusText.isEmpty {
-                        Text(store.engineStatusText).font(.caption).foregroundStyle(.secondary)
-                    }
-                }
             }
 
             Section("悬浮字幕样式") {

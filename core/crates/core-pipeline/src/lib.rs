@@ -232,6 +232,154 @@ impl PipelineCoordinator {
             glossary_added,
         })
     }
+
+    /// Summarize the last `minutes` of a live or completed session and persist as a [`SummaryNote`].
+    pub async fn recap_recent(
+        &self,
+        session_id: &str,
+        minutes: u32,
+        cancel: CancellationToken,
+    ) -> Result<core_model::SummaryNote> {
+        let segments = self.store.list_segments(session_id)?;
+        let window_s = (minutes.max(1) as f64) * 60.0;
+        let max_t1 = segments.iter().map(|s| s.t1).fold(0.0f64, f64::max);
+        let cutoff = (max_t1 - window_s).max(0.0);
+        let recent: Vec<Segment> = segments
+            .into_iter()
+            .filter(|s| s.t1 >= cutoff || max_t1 == 0.0)
+            .collect();
+        let transcript = build_compact_transcript(&recent, 6_000);
+        if transcript.is_empty() {
+            return Err(PipelineError::Storage(core_storage::StorageError::NotFound(
+                "暂无可用于总结的课堂内容".into(),
+            )));
+        }
+        let msgs = PromptBuilder::recap_messages(&transcript, minutes.max(1));
+        let opts = GenerateOptions {
+            temperature: 0.2,
+            max_tokens: 512,
+        };
+        let raw = self.assistant.complete(&msgs, &opts, cancel).await?;
+        let content = ThinkFilter::strip(&raw);
+        let note = self.store.add_summary_note(session_id, &content)?;
+        Ok(note)
+    }
+
+    /// Answer a live or post-class question grounded in recent transcript + uploaded course slides (RAG).
+    pub async fn answer_question(
+        &self,
+        session_id: &str,
+        course_id: Option<&str>,
+        question_text: &str,
+        segment_id: Option<String>,
+        source_tag: &str,
+        cancel: CancellationToken,
+    ) -> Result<core_model::Question> {
+        let recent_segs = self.store.list_segments(session_id)?;
+        let tail_start = recent_segs.len().saturating_sub(25);
+        let transcript_ctx = build_compact_transcript(&recent_segs[tail_start..], 4_000);
+
+        let mut slide_ctx = String::new();
+        let mut effective_source = source_tag.to_string();
+        if let Some(cid) = course_id {
+            if let Ok(hits) = self.store.search_material_chunks(cid, question_text, 3) {
+                if !hits.is_empty() {
+                    effective_source = if source_tag.is_empty() {
+                        "课件+课堂".into()
+                    } else {
+                        format!("{source_tag}·课件")
+                    };
+                    for h in hits {
+                        slide_ctx.push_str(&format!(
+                            "[{} 第{}页]\n{}\n\n",
+                            h.material_name,
+                            h.page,
+                            h.text.chars().take(600).collect::<String>()
+                        ));
+                    }
+                }
+            }
+        }
+
+        let msgs =
+            PromptBuilder::qa_with_slides_messages(question_text, &transcript_ctx, &slide_ctx);
+        let opts = GenerateOptions {
+            temperature: 0.2,
+            max_tokens: 512,
+        };
+        let raw = self.assistant.complete(&msgs, &opts, cancel).await?;
+        let answer = ThinkFilter::strip(&raw);
+        let q = self.store.add_question(
+            session_id,
+            segment_id,
+            question_text.trim(),
+            "",
+            &answer,
+            &effective_source,
+        )?;
+        Ok(q)
+    }
+
+    /// Generate 5 post-class review quiz questions and persist into `session.quiz` (synced to iPhone PWA).
+    pub async fn generate_session_quiz(
+        &self,
+        session_id: &str,
+        cancel: CancellationToken,
+    ) -> Result<Session> {
+        let session = self
+            .store
+            .get_session(session_id)?
+            .ok_or_else(|| core_storage::StorageError::NotFound(session_id.to_string()))?;
+        let segments = self.store.list_segments(session_id)?;
+        let transcript = build_compact_transcript(&segments, 10_000);
+        if transcript.is_empty() {
+            return Ok(session);
+        }
+        let course_name = match &session.course_id {
+            Some(cid) => self
+                .store
+                .get_course(cid)?
+                .map(|c| c.name)
+                .unwrap_or_else(|| "未分类课程".into()),
+            None => "未分类课程".into(),
+        };
+        let msgs = PromptBuilder::quiz_messages(&transcript, &course_name);
+        let opts = GenerateOptions {
+            temperature: 0.3,
+            max_tokens: 1024,
+        };
+        let raw = self.assistant.complete(&msgs, &opts, cancel).await?;
+        let quiz = ThinkFilter::strip(&raw);
+        let updated = self.store.update_session_quiz(session_id, &quiz)?;
+        Ok(updated)
+    }
+
+    /// Generate a pre-class study outline from uploaded course slides/materials.
+    pub async fn generate_course_outline(
+        &self,
+        course_id: &str,
+        cancel: CancellationToken,
+    ) -> Result<core_model::Course> {
+        let course = self
+            .store
+            .get_course(course_id)?
+            .ok_or_else(|| core_storage::StorageError::NotFound(course_id.to_string()))?;
+        let material_text = self.store.sample_course_material_text(course_id, 10_000)?;
+        if material_text.is_empty() {
+            return Err(PipelineError::Storage(core_storage::StorageError::NotFound(
+                "请先上传课程课件或讲义资料".into(),
+            )));
+        }
+        let msgs = PromptBuilder::course_outline_messages(&material_text, &course.name);
+        let opts = GenerateOptions {
+            temperature: 0.3,
+            max_tokens: 1024,
+        };
+        let raw = self.assistant.complete(&msgs, &opts, cancel).await?;
+        let outline = ThinkFilter::strip(&raw);
+        let updated = self.store.update_course_outline(course_id, &outline)?;
+        Ok(updated)
+    }
 }
 
 /// Export a single session (knowledge points, summary, bookmarks, Q&A, glossary, transcript) as clean Markdown.
@@ -411,6 +559,14 @@ mod tests {
                 Ok(r#"[{"title":"反向传播","explanation":"利用链式法则逐层计算损失函数对参数的梯度。","importance":3,"tags":["深度学习"],"source_quote":"Backpropagation computes gradients via chain rule."}]"#.into())
             } else if sys.contains("课程主题标题") {
                 Ok(r#"{"title":"深度学习：反向传播","summary":"本节讲解了梯度计算与链式法则。"}"#.into())
+            } else if sys.contains("课件片段") {
+                Ok("根据课件第 2 页，链式法则把复合函数导数拆成局部梯度乘积。".into())
+            } else if sys.contains("总结最近约") {
+                Ok("- 反向传播使用链式法则高效计算参数梯度".into())
+            } else if sys.contains("5 道高质量课后自测题") {
+                Ok("1. 反向传播为什么需要缓存前向激活值？\n答：用于链式法则计算局部梯度。".into())
+            } else if sys.contains("课前预习提纲") {
+                Ok("- 计算图与链式法则\n- 梯度消失原因".into())
             } else {
                 Ok(r#"[{"term":"Backpropagation","translation":"反向传播","note":"神经网络梯度求解算法"}]"#.into())
             }
@@ -429,6 +585,17 @@ mod tests {
     async fn full_utterance_and_knowledge_finalization_pipeline() {
         let store = Store::open_in_memory("mac-test").unwrap();
         let course = store.create_course("Deep Learning", "课堂").unwrap();
+        store
+            .add_material_pages(
+                &course.id,
+                "Backprop.pdf",
+                "/tmp/backprop.pdf",
+                &[
+                    (1, "Introduction to Neural Networks".into()),
+                    (2, "Chain rule multiplies local gradients during backpropagation.".into()),
+                ],
+            )
+            .unwrap();
         let session = store
             .create_session(Some(course.id.clone()), "system", "auto", "auto")
             .unwrap();
@@ -452,6 +619,41 @@ mod tests {
         assert_eq!(seg.src_lang, "en");
         assert_eq!(seg.tgt_lang, "zh");
         assert!(seg.tgt_text.contains("反向传播"));
+
+        // Slide-grounded Q&A
+        let qa = pipe
+            .answer_question(
+                &session.id,
+                Some(&course.id),
+                "How does chain rule work in backpropagation?",
+                Some(seg.id.clone()),
+                "manual",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(qa.source.contains("课件"));
+        assert!(qa.answer.contains("第 2 页"));
+
+        // 5-minute recap
+        let recap = pipe
+            .recap_recent(&session.id, 5, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(recap.content.contains("链式法则"));
+
+        // Review quiz + Course outline
+        let quizzed = pipe
+            .generate_session_quiz(&session.id, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(quizzed.quiz.contains("答："));
+
+        let outlined = pipe
+            .generate_course_outline(&course.id, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(outlined.outline.contains("计算图"));
 
         let res = pipe
             .finalize_session_knowledge(&session.id, true, CancellationToken::new())

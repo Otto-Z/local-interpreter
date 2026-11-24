@@ -1,5 +1,6 @@
 //! UniFFI bindings exposing `local_interpreter_core` to Swift (macOS / iOS) and Kotlin (Android).
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use core_dsp::{
@@ -509,10 +510,17 @@ impl SpeechSegmenterFfi {
 
 // ---------------------------------------------------------------------- Main Cross-Platform Facade
 
+/// UniFFI callback interface for streaming offline model download progress to Swift & Kotlin UIs.
+#[uniffi::export(callback_interface)]
+pub trait ModelDownloadCallback: Send + Sync {
+    fn on_progress(&self, downloaded_bytes: u64, total_bytes: u64);
+}
+
 #[derive(uniffi::Object)]
 pub struct InterpreterCore {
     store: Store,
     rt: Runtime,
+    download_cancels: Mutex<HashMap<String, CancellationToken>>,
 }
 
 #[uniffi::export]
@@ -521,14 +529,22 @@ impl InterpreterCore {
     pub fn open(db_path: String, device_id: String) -> Result<Arc<Self>, CoreError> {
         let store = Store::open(db_path, device_id)?;
         let rt = Runtime::new().map_err(|e| CoreError::Runtime { msg: e.to_string() })?;
-        Ok(Arc::new(Self { store, rt }))
+        Ok(Arc::new(Self {
+            store,
+            rt,
+            download_cancels: Mutex::new(HashMap::new()),
+        }))
     }
 
     #[uniffi::constructor]
     pub fn open_in_memory(device_id: String) -> Result<Arc<Self>, CoreError> {
         let store = Store::open_in_memory(device_id)?;
         let rt = Runtime::new().map_err(|e| CoreError::Runtime { msg: e.to_string() })?;
-        Ok(Arc::new(Self { store, rt }))
+        Ok(Arc::new(Self {
+            store,
+            rt,
+            download_cancels: Mutex::new(HashMap::new()),
+        }))
     }
 
     pub fn device_id(&self) -> String {
@@ -995,23 +1011,82 @@ impl InterpreterCore {
         model_id: String,
         use_hf_mirror: bool,
     ) -> Result<String, CoreError> {
+        let cancel = self.register_download_cancel(&model_id);
         let dl = ModelDownloader::new(models_dir);
-        let path = self
-            .rt
-            .block_on(dl.download_by_id(
-                &model_id,
-                use_hf_mirror,
-                CancellationToken::new(),
-                |_, _| {},
-            ))
-            .map_err(|e| CoreError::Inference { msg: e.to_string() })?;
+        let res = self.rt.block_on(dl.download_by_id(
+            &model_id,
+            use_hf_mirror,
+            cancel,
+            |_, _| {},
+        ));
+        self.clear_download_cancel(&model_id);
+        let path = res.map_err(|e| CoreError::Inference { msg: e.to_string() })?;
         Ok(path.to_string_lossy().to_string())
     }
 
+    /// Download a model with throttled real-time byte progress callbacks and cooperative cancellation.
+    pub fn download_offline_model_with_progress(
+        &self,
+        models_dir: String,
+        model_id: String,
+        use_hf_mirror: bool,
+        callback: Box<dyn ModelDownloadCallback>,
+    ) -> Result<String, CoreError> {
+        let cancel = self.register_download_cancel(&model_id);
+        let dl = ModelDownloader::new(models_dir);
+        let mut last_reported = 0u64;
+        let res = self.rt.block_on(dl.download_by_id(
+            &model_id,
+            use_hf_mirror,
+            cancel,
+            |downloaded, total| {
+                if downloaded == 0
+                    || downloaded == total
+                    || downloaded.saturating_sub(last_reported) >= 262_144
+                {
+                    last_reported = downloaded;
+                    callback.on_progress(downloaded, total);
+                }
+            },
+        ));
+        self.clear_download_cancel(&model_id);
+        let path = res.map_err(|e| CoreError::Inference { msg: e.to_string() })?;
+        Ok(path.to_string_lossy().to_string())
+    }
+
+    pub fn cancel_offline_model_download(&self, model_id: String) -> bool {
+        if let Ok(mut map) = self.download_cancels.lock() {
+            if let Some(tok) = map.remove(&model_id) {
+                tok.cancel();
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn delete_offline_model(&self, models_dir: String, model_id: String) -> Result<bool, CoreError> {
+        let _ = self.cancel_offline_model_download(model_id.clone());
         ModelDownloader::new(models_dir)
             .delete_model(&model_id)
             .map_err(|e| CoreError::Inference { msg: e.to_string() })
+    }
+}
+
+impl InterpreterCore {
+    fn register_download_cancel(&self, model_id: &str) -> CancellationToken {
+        let tok = CancellationToken::new();
+        if let Ok(mut map) = self.download_cancels.lock() {
+            if let Some(prev) = map.insert(model_id.to_string(), tok.clone()) {
+                prev.cancel();
+            }
+        }
+        tok
+    }
+
+    fn clear_download_cancel(&self, model_id: &str) {
+        if let Ok(mut map) = self.download_cancels.lock() {
+            map.remove(model_id);
+        }
     }
 }
 

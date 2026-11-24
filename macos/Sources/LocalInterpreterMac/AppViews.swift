@@ -120,8 +120,20 @@ struct LiveInterpreterView: View {
                     if !store.isCapturing {
                         Button("开始内录系统声音") { store.startLiveSession(source: .system) }
                             .buttonStyle(.borderedProminent)
+                            .disabled(store.importingFile)
                         Button("开始麦克风同传") { store.startLiveSession(source: .mic) }
                             .buttonStyle(.bordered)
+                            .disabled(store.importingFile)
+                        Button(store.importingFile ? "导入中…" : "导入录播课") {
+                            let panel = NSOpenPanel()
+                            panel.allowedContentTypes = [.audio, .movie, .mpeg4Movie, .mp3, .wav]
+                            panel.allowsMultipleSelection = false
+                            if panel.runModal() == .OK, let url = panel.url {
+                                store.importRecordedMediaFile(url: url)
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(store.importingFile)
                     } else {
                         Button("下课并提炼知识点") { store.stopLiveSessionAndFinalize() }
                             .buttonStyle(.borderedProminent)
@@ -441,7 +453,17 @@ struct SyncAndSettingsView: View {
                             Button("删除", role: .destructive) { store.deleteModel(id: model.id) }
                                 .controlSize(.small)
                         } else if store.downloadingModelId == model.id {
-                            ProgressView().controlSize(.small)
+                            HStack(spacing: 8) {
+                                ProgressView(value: store.downloadProgress)
+                                    .frame(width: 90)
+                                Text(store.downloadProgressText)
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                                Button("取消", role: .destructive) {
+                                    store.cancelModelDownload(id: model.id)
+                                }
+                                .controlSize(.small)
+                            }
                         } else {
                             Button("下载") { store.downloadModel(id: model.id) }
                                 .buttonStyle(.bordered)

@@ -30,6 +30,9 @@ final class CoreStore: ObservableObject {
     @Published var isSyncing: Bool = false
     @Published var assistantBusy: Bool = false
     @Published var downloadingModelId: String? = nil
+    @Published var downloadProgress: Double = 0.0
+    @Published var downloadProgressText: String = ""
+    @Published var importingFile: Bool = false
     @Published var engineStatusText: String = ""
 
     // Persisted settings
@@ -435,34 +438,158 @@ final class CoreStore: ObservableObject {
 
     // MARK: - Offline Models & Local Metal Engine Launcher
 
+    private final class SwiftDownloadCallback: ModelDownloadCallback, @unchecked Sendable {
+        let onUpdate: (UInt64, UInt64) -> Void
+        init(_ onUpdate: @escaping (UInt64, UInt64) -> Void) { self.onUpdate = onUpdate }
+        func onProgress(downloadedBytes: UInt64, totalBytes: UInt64) {
+            onUpdate(downloadedBytes, totalBytes)
+        }
+    }
+
     func downloadModel(id: String) {
         guard downloadingModelId == nil else { return }
         downloadingModelId = id
+        downloadProgress = 0
+        downloadProgressText = "连接中…"
         statusMessage = "正在后台断点续传下载模型 \(id)…"
         let dir = modelsDir
         let mirror = useHfMirror
         let coreRef = core
+        let cb = SwiftDownloadCallback { [weak self] downloaded, total in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let mbDown = Double(downloaded) / 1_048_576.0
+                if total > 0 {
+                    let mbTotal = Double(total) / 1_048_576.0
+                    let ratio = min(1.0, Double(downloaded) / Double(total))
+                    self.downloadProgress = ratio
+                    self.downloadProgressText = String(format: "%.0f%% (%.0f/%.0f MB)", ratio * 100.0, mbDown, mbTotal)
+                } else {
+                    self.downloadProgressText = String(format: "%.1f MB", mbDown)
+                }
+            }
+        }
         Task.detached(priority: .utility) { [weak self] in
             do {
-                let path = try coreRef.downloadOfflineModel(modelsDir: dir, modelId: id, useHfMirror: mirror)
+                let path = try coreRef.downloadOfflineModelWithProgress(
+                    modelsDir: dir,
+                    modelId: id,
+                    useHfMirror: mirror,
+                    callback: cb
+                )
                 await MainActor.run {
                     self?.downloadingModelId = nil
+                    self?.downloadProgress = 1.0
+                    self?.downloadProgressText = ""
                     self?.statusMessage = "模型下载完成：\(URL(fileURLWithPath: path).lastPathComponent)"
                     self?.reloadAll()
                 }
             } catch {
                 await MainActor.run {
                     self?.downloadingModelId = nil
-                    self?.statusMessage = "模型下载失败：\(error.localizedDescription)"
+                    self?.downloadProgress = 0
+                    self?.downloadProgressText = ""
+                    self?.statusMessage = "模型下载中止或失败：\(error.localizedDescription)"
                     self?.reloadAll()
                 }
             }
         }
     }
 
+    func cancelModelDownload(id: String) {
+        _ = core.cancelOfflineModelDownload(modelId: id)
+        statusMessage = "已请求取消下载（保留 .part 断点）"
+    }
+
     func deleteModel(id: String) {
         _ = try? core.deleteOfflineModel(modelsDir: modelsDir, modelId: id)
         reloadAll()
+    }
+
+    /// Decode a local recorded lecture audio/video file (`.wav/.m4a/.mp3/.mp4/.mov`) via native AVAssetReader,
+    /// run Rust VAD + ASR + translation, extract knowledge points, and optionally sync to Google Cloud.
+    func importRecordedMediaFile(url: URL) {
+        guard !isCapturing && !importingFile else { return }
+        importingFile = true
+        statusMessage = "正在解码并转写录播文件「\(url.lastPathComponent)」…"
+
+        let courseId = selectedCourseId
+        let srcPref = sourceLang
+        let tgtPref = targetLang
+        let pause = UInt32(max(200, pauseMs))
+        let asrEp = FfiAsrEndpoint(baseUrl: asrBaseUrl, apiKey: asrApiKey, model: asrModel)
+        let llmEp = FfiLlmEndpoint(baseUrl: llmBaseUrl, apiKey: llmApiKey, model: llmModel)
+        let shouldAutoSync = autoSyncAfterClass && !cloudRunUrl.trimmingCharacters(in: .whitespaces).isEmpty
+        let coreRef = core
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            do {
+                let session = try coreRef.createSession(
+                    courseId: courseId,
+                    audioSource: "file",
+                    sourceLang: srcPref,
+                    targetLang: tgtPref
+                )
+                await MainActor.run {
+                    self?.selectedSession = session
+                    self?.reloadAll()
+                }
+
+                let seg = SpeechSegmenterFfi(minSilenceMs: pause, maxSegmentMs: 15_000)
+                var allSpeeches: [FfiSpeechSegment] = []
+                try await AudioFileImporter.decodeTo16kMonoChunks(url: url) { chunk in
+                    let ready = seg.pushSamples(pcm16k: chunk)
+                    if !ready.isEmpty { allSpeeches.append(contentsOf: ready) }
+                }
+                if let tail = seg.flush(), !tail.samples.isEmpty {
+                    allSpeeches.append(tail)
+                }
+
+                let total = allSpeeches.count
+                for (idx, sp) in allSpeeches.enumerated() {
+                    await MainActor.run {
+                        self?.statusMessage = "正在转写翻译录播片段 \(idx + 1)/\(total)…"
+                    }
+                    _ = try? coreRef.processAudioSegment(
+                        asrEndpoint: asrEp,
+                        llmEndpoint: llmEp,
+                        sessionId: session.id,
+                        courseId: courseId,
+                        t0: sp.t0S,
+                        t1: sp.t1S,
+                        srcLangHint: srcPref,
+                        targetPref: tgtPref,
+                        pcm16k: sp.samples
+                    )
+                    if idx % 3 == 0 || idx + 1 == total {
+                        await MainActor.run { self?.reloadAll() }
+                    }
+                }
+
+                await MainActor.run {
+                    self?.statusMessage = "录播转写完成，正在提炼核心知识点…"
+                }
+                let updated = try coreRef.finalizeSessionKnowledge(
+                    endpoint: llmEp,
+                    sessionId: session.id,
+                    extractGlossary: true
+                )
+                await MainActor.run {
+                    self?.importingFile = false
+                    self?.selectedSession = updated
+                    self?.statusMessage = "录播导入完成：共 \(total) 段，提炼 \(updated.knowledgePoints.count) 条知识点"
+                    self?.reloadAll()
+                }
+                if shouldAutoSync {
+                    await self?.syncNow()
+                }
+            } catch {
+                await MainActor.run {
+                    self?.importingFile = false
+                    self?.statusMessage = "录播文件转写失败：\(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     /// Launch local `llama-server` & `whisper-server` with Apple Silicon Metal offload using downloaded models.

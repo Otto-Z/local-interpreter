@@ -1,6 +1,29 @@
-# 本地同传 · 离线实时语音翻译（macOS）
+# 本地同传 · 全端离线实时语音翻译与知识点复习
 
-> **Android 平板版**已经放在 [`android/`](android/README.md)：功能对齐 macOS 版，完全离线。安装包：`dist/本地同传-Android-2.2.15.apk`。
+> **v3.0 全端架构（Mac + 安卓平板 + Google Cloud + iPhone 知识点 PWA）已就绪**
+> - **共享核心**：[`core/`](core/crates)（Rust Workspace + UniFFI，统一 UUIDv7 数据库、抗混叠重采样/VAD、OpenAI/Whisper/本地推理、课件 RAG、课后知识点提炼、断点续传模型下载与端到端加密同步）
+> - **新版 Mac 端**：[`macos/`](macos/Package.swift)（SwiftUI + ScreenCaptureKit + NSPanel 悬浮字幕 + PDFKit 课件检索 + 录播课导入）
+> - **Google Cloud 同步与 iPhone PWA**：[`cloud/`](cloud/src/lib.rs)（Cloud Run 缩容到 0 + GCS 持久化，iPhone Safari 添加到主屏幕离线刷知识点、术语闪卡与自测题）
+> - **Android 平板版**：[`android/`](android/README.md)（原生 `llama.cpp` + `sherpa-onnx` + 悬浮窗，已内置 Google Cloud 双向同步）
+
+### v3.0 四步极速上手（Mac ↔ 安卓平板 ↔ iPhone 互通）
+
+```bash
+# 1. 部署 Google Cloud Run + GCS（生成 iPhone PWA 访问地址）
+PROJECT_ID=你的GCP项目ID REGION=asia-east1 SYNC_AUTH_TOKEN=$(openssl rand -hex 24) ./cloud/deploy-gcp.sh
+
+# 2. 在 Apple Silicon Mac 上编译 Rust XCFramework 并打包 LocalInterpreterMac.app
+./scripts/package_macos_app.sh && open dist/LocalInterpreterMac.app
+
+# 3. iPhone：Safari 打开步骤 1 输出的 URL → 分享 →「添加到主屏幕」→ 输入同一 SYNC_AUTH_TOKEN
+# 4. 安卓平板：设置 → 存储与诊断 →「Google Cloud 跨端同步」填入同一 URL 与 Token
+```
+
+---
+
+## 原版 macOS（Python + Swift 壳）说明
+
+> **Android 平板版**详细文档见 [`android/README.md`](android/README.md)。
 
 一个真正的 macOS 应用：不在浏览器里打开，双击即用。麦克风或电脑里正在播放的声音 → 本地 Whisper 识别 → 本地大模型流式翻译 → 实时字幕。全部在本机完成，不联网、不上传。
 

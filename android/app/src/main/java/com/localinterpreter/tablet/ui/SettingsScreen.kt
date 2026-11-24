@@ -153,6 +153,8 @@ fun SettingsScreen(
     var showLog by remember { mutableStateOf(false) }
     var logText by remember { mutableStateOf("") }
     var pendingLogExport by remember { mutableStateOf<String?>(null) }
+    var cloudSyncBusy by remember { mutableStateOf(false) }
+    var cloudSyncStatus by remember { mutableStateOf("") }
     var calibrating by remember { mutableStateOf(false) }
     var calibProgress by remember { mutableFloatStateOf(0f) }
     var calibMessage by remember { mutableStateOf("") }
@@ -236,7 +238,7 @@ fun SettingsScreen(
     val versionName = remember(context) {
         runCatching {
             context.packageManager.getPackageInfo(context.packageName, 0).versionName
-        }.getOrNull().orEmpty().ifBlank { "2.3.0" }
+        }.getOrNull().orEmpty().ifBlank { "2.4.0" }
     }
 
     fun toast(t: String) = Toast.makeText(context, t, Toast.LENGTH_SHORT).show()
@@ -448,33 +450,46 @@ fun SettingsScreen(
                                                     subtitle = "完全离线 · Hy-MT2-1.8B",
                                                     selected = settings.llmMode == SettingsData.MODE_BUILTIN,
                                                     modifier = Modifier.weight(1f),
-                                                    enabled = !live.running && !live.starting,
+                                                    enabled = !liveBusy && !evalBusy && !selfTestBusy,
                                                 ) { app.settings.update { it.copy(llmMode = SettingsData.MODE_BUILTIN) }; app.llm.warmUpTranslator() }
                                                 ChoiceCard(
                                                     title = "本地服务 / API",
                                                     subtitle = "任意 OpenAI 兼容接口",
                                                     selected = settings.llmMode == SettingsData.MODE_API,
                                                     modifier = Modifier.weight(1f),
-                                                    enabled = !live.running && !live.starting,
+                                                    enabled = !liveBusy && !evalBusy && !selfTestBusy,
                                                 ) { app.settings.update { it.copy(llmMode = SettingsData.MODE_API) } }
                                             }
                                             Spacer(Modifier.height(12.dp))
                                             if (settings.llmMode == SettingsData.MODE_BUILTIN) {
+                                                val variantReady = remember(progress, settings.modelVariant) {
+                                                    app.models.translatorReady(settings.modelVariant)
+                                                }
                                                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                                     ChoiceCard(
                                                         title = "Q4_K_M · 1.1GB",
                                                         subtitle = "推荐 · 质量与速度均衡",
                                                         selected = settings.modelVariant == "q4",
                                                         modifier = Modifier.weight(1f),
-                                                        enabled = !live.running && !live.starting,
-                                                    ) { app.settings.update { it.copy(modelVariant = "q4") } }
+                                                        enabled = !liveBusy && !evalBusy && !selfTestBusy,
+                                                    ) {
+                                                        if (settings.modelVariant != "q4") {
+                                                            app.settings.update { it.copy(modelVariant = "q4") }
+                                                            app.llm.unloadTranslator()
+                                                        }
+                                                    }
                                                     ChoiceCard(
                                                         title = "2bit · 600MB",
                                                         subtitle = "更快 · 更省内存",
                                                         selected = settings.modelVariant == "q2",
                                                         modifier = Modifier.weight(1f),
-                                                        enabled = !live.running && !live.starting,
-                                                    ) { app.settings.update { it.copy(modelVariant = "q2") } }
+                                                        enabled = !liveBusy && !evalBusy && !selfTestBusy,
+                                                    ) {
+                                                        if (settings.modelVariant != "q2") {
+                                                            app.settings.update { it.copy(modelVariant = "q2") }
+                                                            app.llm.unloadTranslator()
+                                                        }
+                                                    }
                                                 }
                                                 Spacer(Modifier.height(10.dp))
                                                 Row(
@@ -484,10 +499,11 @@ fun SettingsScreen(
                                                         .padding(horizontal = 12.dp, vertical = 8.dp),
                                                     verticalAlignment = Alignment.CenterVertically,
                                                 ) {
-                                                    Dot(if (app.models.translatorReady(settings.modelVariant)) c.accent else c.warn, 7)
+                                                    Dot(if (variantReady) c.accent else c.warn, 7)
                                                     Spacer(Modifier.width(8.dp))
+                                                    val displayStatus = if (!variantReady) "未下载（可在「模型管理」下载）" else translatorStatus
                                                     Text(
-                                                        "状态：$translatorStatus" + if (backendInfo.isNotBlank()) " · 后端：$backendInfo" else "",
+                                                        "状态：$displayStatus" + if (backendInfo.isNotBlank()) " · 后端：$backendInfo" else "",
                                                         style = MaterialTheme.typography.labelMedium,
                                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                                     )
@@ -537,18 +553,19 @@ fun SettingsScreen(
                                                                         var first = 0L
                                                                         val text = app.llm.translate(
                                                                             "今天下午三点我们在大会议室开项目评审会，请把上周的原型带过来。",
-                                                                            "zh", "en", maxTokens = 96, temperature = 0.2f,
+                                                                            "zh", "en", maxTokens = 96, temperature = 0.0f,
                                                                         ) { if (first == 0L) first = System.currentTimeMillis() }
                                                                         val total = System.currentTimeMillis() - start
                                                                         evalResult = "首字 ${if (first > 0) first - start else total}ms · 整句 ${total}ms\n$text"
                                                                     } catch (e: Exception) {
                                                                         evalResult = "评测失败：${e.message?.take(120)}"
+                                                                    } finally {
+                                                                        evalBusy = false
                                                                     }
-                                                                    evalBusy = false
                                                                 }
                                                             }
                                                         },
-                                                        enabled = !evalBusy && !live.running && !live.starting,
+                                                        enabled = !evalBusy && !liveBusy && !selfTestBusy,
                                                     )
                                                     Text("用固定例句测试当前首字与整句耗时", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                                 }
@@ -590,8 +607,9 @@ fun SettingsScreen(
                                                                 apiMessage = if (list.isEmpty()) "没有发现模型，可手动填写" else "发现 ${list.size} 个模型"
                                                             } catch (e: Exception) {
                                                                 apiMessage = "连接失败：${e.message?.take(80) ?: ""}"
+                                                            } finally {
+                                                                apiBusy = false
                                                             }
-                                                            apiBusy = false
                                                         }
                                                     },
                                                     onTest = {
@@ -603,14 +621,15 @@ fun SettingsScreen(
                                                                 var first = 0L
                                                                 val text = app.llm.translate(
                                                                     "今天下午三点我们在大会议室开项目评审会，请把上周的原型带过来。",
-                                                                    "zh", "en", maxTokens = 120, temperature = 0.2f,
+                                                                    "zh", "en", maxTokens = 120, temperature = 0.1f,
                                                                 ) { if (first == 0L) first = System.currentTimeMillis() }
                                                                 val total = System.currentTimeMillis() - start
                                                                 apiMessage = "成功，首字 ${if (first > 0) first - start else total}ms，整句 ${total}ms：${text.take(40)}"
                                                             } catch (e: Exception) {
                                                                 apiMessage = "失败：${e.message?.take(100) ?: ""}"
+                                                            } finally {
+                                                                apiBusy = false
                                                             }
-                                                            apiBusy = false
                                                         }
                                                     },
                                                 )
@@ -652,6 +671,13 @@ fun SettingsScreen(
                                                 enabled = settings.assistantEnabled,
                                                 onChange = { v -> app.settings.update { it.copy(autoQuestion = v) } },
                                             )
+                                            SwitchRow(
+                                                title = "下课后自动补充课程术语表",
+                                                subtitle = "结束后自动从本课字幕中提炼新术语并加入所属课程",
+                                                checked = settings.autoTerms,
+                                                enabled = settings.assistantEnabled,
+                                                onChange = { v -> app.settings.update { it.copy(autoTerms = v) } },
+                                            )
                                             Spacer(Modifier.height(8.dp))
                                             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                                 ChoiceCard(
@@ -659,14 +685,14 @@ fun SettingsScreen(
                                                     subtitle = "Qwen3-4B / 轻量 1.5B · 离线",
                                                     selected = settings.analysisMode == SettingsData.MODE_BUILTIN,
                                                     modifier = Modifier.weight(1f),
-                                                    enabled = !live.running && !live.starting,
+                                                    enabled = !liveBusy,
                                                 ) { app.settings.update { it.copy(analysisMode = SettingsData.MODE_BUILTIN) } }
                                                 ChoiceCard(
                                                     title = "API 接口",
                                                     subtitle = "复用翻译 API 或单独配置",
                                                     selected = settings.analysisMode == SettingsData.MODE_API,
                                                     modifier = Modifier.weight(1f),
-                                                    enabled = !live.running && !live.starting,
+                                                    enabled = !liveBusy,
                                                 ) { app.settings.update { it.copy(analysisMode = SettingsData.MODE_API) } }
                                             }
                                             if (settings.analysisMode == SettingsData.MODE_BUILTIN) {
@@ -677,15 +703,25 @@ fun SettingsScreen(
                                                         subtitle = "质量优先，建议 8GB+ 内存",
                                                         selected = settings.assistantVariant == "4b",
                                                         modifier = Modifier.weight(1f),
-                                                        enabled = !live.running && !live.starting,
-                                                    ) { app.settings.update { it.copy(assistantVariant = "4b") } }
+                                                        enabled = !liveBusy,
+                                                    ) {
+                                                        if (settings.assistantVariant != "4b") {
+                                                            app.settings.update { it.copy(assistantVariant = "4b") }
+                                                            app.llm.unloadAssistant()
+                                                        }
+                                                    }
                                                     ChoiceCard(
                                                         title = "1.5B · 1.1GB",
                                                         subtitle = "更省内存，响应更快",
                                                         selected = settings.assistantVariant == "1.5b",
                                                         modifier = Modifier.weight(1f),
-                                                        enabled = !live.running && !live.starting,
-                                                    ) { app.settings.update { it.copy(assistantVariant = "1.5b") } }
+                                                        enabled = !liveBusy,
+                                                    ) {
+                                                        if (settings.assistantVariant != "1.5b") {
+                                                            app.settings.update { it.copy(assistantVariant = "1.5b") }
+                                                            app.llm.unloadAssistant()
+                                                        }
+                                                    }
                                                 }
                                             }
                                             Spacer(Modifier.height(10.dp))
@@ -801,7 +837,7 @@ fun SettingsScreen(
                                                         }
                                                     },
                                                     accent = true,
-                                                    enabled = !selfTestBusy && !live.running && !live.starting,
+                                                    enabled = !selfTestBusy && !liveBusy && !evalBusy,
                                                 )
                                                 Text(
                                                     "内置 16 秒测试音频，不经过麦克风",
@@ -959,7 +995,7 @@ fun SettingsScreen(
                                         ) {
                                             val info = storage
                                             if (info != null) {
-                                                val usedTotal = (info.databaseBytes + info.audioBytes + info.materialBytes + info.modelBytes).coerceAtLeast(1L)
+                                                val usedTotal = info.databaseBytes + info.audioBytes + info.materialBytes + info.modelBytes
                                                 // 分段存储占比条
                                                 Row(
                                                     Modifier
@@ -968,14 +1004,17 @@ fun SettingsScreen(
                                                         .clip(RoundedCornerShape(999.dp))
                                                         .background(MaterialTheme.colorScheme.surfaceVariant),
                                                 ) {
-                                                    val modelW = (info.modelBytes.toFloat() / usedTotal).coerceAtLeast(0.02f)
-                                                    val audioW = (info.audioBytes.toFloat() / usedTotal).coerceAtLeast(0f)
-                                                    val matW = (info.materialBytes.toFloat() / usedTotal).coerceAtLeast(0f)
-                                                    val dbW = (info.databaseBytes.toFloat() / usedTotal).coerceAtLeast(0.01f)
-                                                    Box(Modifier.weight(modelW).fillMaxHeight().background(c.accent))
-                                                    if (audioW > 0.005f) Box(Modifier.weight(audioW).fillMaxHeight().background(c.secondary))
-                                                    if (matW > 0.005f) Box(Modifier.weight(matW).fillMaxHeight().background(c.warn))
-                                                    Box(Modifier.weight(dbW).fillMaxHeight().background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)))
+                                                    if (usedTotal > 0L) {
+                                                        val totalF = usedTotal.toFloat()
+                                                        val modelW = if (info.modelBytes > 0L) (info.modelBytes / totalF).coerceAtLeast(0.02f) else 0f
+                                                        val audioW = if (info.audioBytes > 0L) (info.audioBytes / totalF).coerceAtLeast(0.01f) else 0f
+                                                        val matW = if (info.materialBytes > 0L) (info.materialBytes / totalF).coerceAtLeast(0.01f) else 0f
+                                                        val dbW = if (info.databaseBytes > 0L) (info.databaseBytes / totalF).coerceAtLeast(0.01f) else 0f
+                                                        if (modelW > 0f) Box(Modifier.weight(modelW).fillMaxHeight().background(c.accent))
+                                                        if (audioW > 0f) Box(Modifier.weight(audioW).fillMaxHeight().background(c.secondary))
+                                                        if (matW > 0f) Box(Modifier.weight(matW).fillMaxHeight().background(c.warn))
+                                                        if (dbW > 0f) Box(Modifier.weight(dbW).fillMaxHeight().background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)))
+                                                    }
                                                 }
                                                 Spacer(Modifier.height(10.dp))
                                                 InfoRow("离线模型", gb(info.modelBytes), c.accent)
@@ -997,7 +1036,7 @@ fun SettingsScreen(
                                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                                 Column(Modifier.weight(1f)) {
                                                     Text("历史课次清理策略", style = MaterialTheme.typography.bodyMedium)
-                                                    Text("按保留天数手动一键清理旧课次与录音", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                    Text("应用启动时自动清理到期课次，也可随时手动一键清理", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                                 }
                                                 Dropdown(
                                                     value = settings.autoCleanupDays.toString(),
@@ -1008,6 +1047,72 @@ fun SettingsScreen(
                                             }
                                             Spacer(Modifier.height(10.dp))
                                             MiniButton("立即按策略清理", { confirmCleanup = true }, accent = true, enabled = settings.autoCleanupDays > 0)
+                                        }
+                                    }
+                                    item {
+                                        SectionCard(
+                                            title = "Google Cloud 跨端同步",
+                                            subtitle = "与 Mac 版及 iPhone 知识点 PWA 双向同步课次、知识点、术语表与收藏",
+                                            icon = Icons.Default.CloudDownload,
+                                        ) {
+                                            OutlinedTextField(
+                                                value = settings.cloudSyncUrl,
+                                                onValueChange = { v -> app.settings.update { it.copy(cloudSyncUrl = v.trim()) } },
+                                                label = { Text("Cloud Run 服务地址") },
+                                                placeholder = { Text("https://local-interpreter-cloud-xxx.run.app") },
+                                                singleLine = true,
+                                                modifier = Modifier.fillMaxWidth(),
+                                            )
+                                            Spacer(Modifier.height(8.dp))
+                                            OutlinedTextField(
+                                                value = settings.cloudSyncToken,
+                                                onValueChange = { v -> app.settings.update { it.copy(cloudSyncToken = v.trim()) } },
+                                                label = { Text("Sync Auth Token（与 Mac / iPhone 一致）") },
+                                                singleLine = true,
+                                                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                                                modifier = Modifier.fillMaxWidth(),
+                                            )
+                                            Spacer(Modifier.height(8.dp))
+                                            SwitchRow(
+                                                title = "下课总结完成后自动同步",
+                                                subtitle = "仅上传纯文本知识点、双语字幕与术语，原始录音留在本机",
+                                                checked = settings.cloudAutoSync,
+                                                onChange = { v -> app.settings.update { it.copy(cloudAutoSync = v) } },
+                                            )
+                                            Spacer(Modifier.height(8.dp))
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                            ) {
+                                                MiniButton(
+                                                    text = if (cloudSyncBusy) "同步中…" else "立即同步 Google Cloud",
+                                                    onClick = {
+                                                        cloudSyncBusy = true
+                                                        cloudSyncStatus = "正在连接 Google Cloud…"
+                                                        scope.launch {
+                                                            val res = app.cloudSync.syncNow()
+                                                            cloudSyncBusy = false
+                                                            res.onSuccess { st ->
+                                                                cloudSyncStatus = "同步成功：上传 ${st.pushedItems} 项，拉取 ${st.pulledItems} 项"
+                                                                toast(cloudSyncStatus)
+                                                            }.onFailure { err ->
+                                                                cloudSyncStatus = "同步失败：${err.message ?: err.javaClass.simpleName}"
+                                                                toast(cloudSyncStatus)
+                                                            }
+                                                        }
+                                                    },
+                                                    accent = true,
+                                                    enabled = !cloudSyncBusy && settings.cloudSyncUrl.isNotBlank(),
+                                                )
+                                                if (cloudSyncStatus.isNotBlank()) {
+                                                    Text(
+                                                        cloudSyncStatus,
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                        modifier = Modifier.weight(1f),
+                                                    )
+                                                }
+                                            }
                                         }
                                     }
                                     item {
@@ -1457,7 +1562,14 @@ private fun ModelRow(
                 )
                 if (p?.state == "error") {
                     MiniButton("删除并重下", {
-                        app.appScope.launch {
+                        app.appScope.launch(Dispatchers.IO) {
+                            runCatching {
+                                when (kind) {
+                                    ModelKind.TRANSLATOR, ModelKind.TRANSLATOR_LITE -> app.llm.unloadTranslator()
+                                    ModelKind.ASSISTANT, ModelKind.ASSISTANT_LITE -> app.llm.unloadAssistant()
+                                    ModelKind.SENSEVOICE -> app.live.releaseAsrCache()
+                                }
+                            }
                             app.models.delete(kind)
                             app.models.download(kind, settings.hfMirror)
                         }
@@ -1564,16 +1676,16 @@ private fun diagnosticHeader(app: App): String {
     }.trim()
 }
 
-private suspend fun runSelfTest(context: android.content.Context, app: App): String {
+private suspend fun runSelfTest(context: android.content.Context, app: App): String = withContext(Dispatchers.Default) {
     app.live.releaseAsrCache()
     val asr = com.localinterpreter.tablet.asr.AsrEngine()
     var vad: com.localinterpreter.tablet.asr.VadSegmenter? = null
-    return try {
+    try {
         val t0 = System.currentTimeMillis()
-        if (!asr.ensureLoaded("zh")) return "自检失败：${asr.status.value}"
+        if (!asr.ensureLoaded("zh")) return@withContext "自检失败：${asr.status.value}"
         val loadMs = System.currentTimeMillis() - t0
         val samples = withContext(Dispatchers.IO) { readWav(context, "test_zh.wav") }
-        if (samples.isEmpty()) return "自检失败：测试音频读取失败"
+        if (samples.isEmpty()) return@withContext "自检失败：测试音频读取失败"
         val segmenter = com.localinterpreter.tablet.asr.VadSegmenter(400).also { vad = it }
         val window = segmenter.windowSize
         var i = 0
@@ -1607,8 +1719,9 @@ private suspend fun runSelfTest(context: android.content.Context, app: App): Str
         val first = texts.firstOrNull()?.first ?: ""
         var firstTok = 0L
         val trStart = System.currentTimeMillis()
+        val temp = if (app.settings.value.llmMode == SettingsData.MODE_API) 0.1f else 0.0f
         val tr = if (first.isNotBlank()) {
-            app.llm.translate(first, "zh", "en", maxTokens = 200, temperature = 0.2f) {
+            app.llm.translate(first, "zh", "en", maxTokens = 200, temperature = temp) {
                 if (firstTok == 0L) firstTok = System.currentTimeMillis()
             }
         } else ""

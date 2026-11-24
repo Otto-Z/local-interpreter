@@ -93,7 +93,7 @@ class OverlayService : Service() {
         }
         if (view == null) addOverlay() else view?.visibility = View.VISIBLE
         if (view != null) setRunning(true)
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -291,7 +291,7 @@ class OverlayService : Service() {
     private fun applySettings(s: SettingsData) {
         val density = resources.displayMetrics.density
         mainText?.textSize = (s.subtitleSize * 0.72f).coerceIn(15f, 34f)
-        mainText?.maxLines = s.subtitleLines.coerceIn(1, 4) + 1
+        mainText?.maxLines = (s.subtitleLines.coerceIn(1, 4) * 2).coerceAtLeast(3)
         subText?.textSize = (s.subtitleSize * 0.42f).coerceIn(10f, 18f)
         background?.let { bg ->
             val alpha = (s.overlayOpacity.coerceIn(0.2f, 1f) * 255).toInt()
@@ -326,7 +326,7 @@ class OverlayService : Service() {
             }
         )
 
-        mainText?.maxLines = lineCount + 1
+        mainText?.maxLines = (lineCount * 2).coerceAtLeast(3)
         mainText?.text = main.ifBlank {
             if (st.running) "正在聆听…" else "点击主界面「开始同传」即可显示实时字幕"
         }
@@ -382,7 +382,8 @@ class OverlayService : Service() {
         }
 
         fun stop(context: Context) {
-            context.startService(Intent(context, OverlayService::class.java).setAction(ACTION_STOP))
+            setRunning(false)
+            runCatching { context.stopService(Intent(context, OverlayService::class.java)) }
         }
     }
 }

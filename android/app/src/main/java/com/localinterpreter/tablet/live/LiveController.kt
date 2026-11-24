@@ -264,16 +264,13 @@ class LiveController(private val app: App) {
         startWorkers()
         val settings = app.settings.value
         latProbe = settings.latencyProbe
-        val sessionCourse = courseId?.takeIf {
-            runCatching { app.db.getCourse(it) != null }.getOrDefault(false)
-        }
-        this.courseId = sessionCourse
+        this.courseId = courseId
         sourceLangPref = settings.sourceLang
         targetLangPref = settings.targetLang
-        glossaryText = if (sessionCourse != null) app.db.glossaryPrompt(sessionCourse) else ""
+        glossaryText = ""
         AppLog.d(
             "Live",
-            "开始同传 source=$source course=${sessionCourse ?: "-"} src=${settings.sourceLang} tgt=${settings.targetLang} " +
+            "开始同传 source=$source course=${courseId ?: "-"} src=${settings.sourceLang} tgt=${settings.targetLang} " +
                 "mode=${settings.llmMode}/${settings.modelVariant} asrThreads=${settings.asrThreads} llmThreads=${settings.llmThreads} " +
                 "pause=${settings.pauseMs} noise=${settings.noiseSuppression} ctx=${settings.translationContext} " +
                 "draft=${settings.draftTranslate} diar=${settings.diarization} " +
@@ -306,6 +303,17 @@ class LiveController(private val app: App) {
             var localChannel: Channel<FloatArray>? = null
             var localCap: AudioCapture? = null
             try {
+                val (sessionCourse, loadedGlossary) = withContext(Dispatchers.IO) {
+                    val validCourse = courseId?.takeIf {
+                        runCatching { app.db.getCourse(it) != null }.getOrDefault(false)
+                    }
+                    val gloss = if (validCourse != null) {
+                        runCatching { app.db.glossaryPrompt(validCourse) }.getOrDefault("")
+                    } else ""
+                    validCourse to gloss
+                }
+                this@LiveController.courseId = sessionCourse
+                glossaryText = loadedGlossary
                 val ok = asr.ensureLoaded(sourceLangPref)
                 if (!ok) {
                     _state.update { it.copy(starting = false, error = asr.status.value) }
@@ -382,8 +390,8 @@ class LiveController(private val app: App) {
                                 }
                                 var sent = channel.trySend(frames)
                                 // 真正的阻塞反压：文件线程宁可等 VAD 消费，也绝不丢音频帧。
-                                while (sent.isFailure && _state.value.running &&
-                                    !_state.value.stopping && !channel.isClosedForSend
+                                while (sent.isFailure && !sent.isClosed &&
+                                    _state.value.running && !_state.value.stopping
                                 ) {
                                     try {
                                         Thread.sleep(10)
@@ -1299,8 +1307,9 @@ class LiveController(private val app: App) {
 
     private suspend fun handleTranslation(job: TranslateJob) {
         val settings = app.settings.value
-        // 新会话已经开始时，旧会话积压的翻译任务直接跳过，别让新字幕排队。
-        if (_state.value.running && _state.value.sessionId != job.sessionId) return
+        // 新会话已经开始或正在启动时，旧会话积压的翻译任务直接跳过，别让新字幕排队。
+        val curState = _state.value
+        if ((curState.running || curState.starting) && curState.sessionId != job.sessionId) return
         AppLog.d(
             "Live",
             "翻译开始 segment=${job.segmentId} text=${job.text.length}字 src=${job.srcLang} " +
@@ -1471,11 +1480,13 @@ class LiveController(private val app: App) {
 
     private suspend fun maybeCorrect(segmentId: Long, text: String) {
         if (app.settings.value.llmMode == SettingsData.MODE_API) return
+        val initial = _state.value
+        if (!initial.running || initial.paused) return
+        if (translatePending.get() > 0 || finalPending.get() > 0) return
+        delay(1500)
         val st = _state.value
         if (!st.running || st.paused) return
         if (translatePending.get() > 0 || finalPending.get() > 0) return
-        delay(1500)
-        if (translatePending.get() > 0) return
         val context = st.segments.takeLast(3).joinToString(" / ") { it.src }
         val epoch = translationEpoch
         backgroundTasks.incrementAndGet()
@@ -1548,7 +1559,7 @@ class LiveController(private val app: App) {
     ) {
         val text = tgt.ifBlank { src }.trim()
         if (text.length < 3 || text.length > 90) return
-        if (!looksLikeQuestion(text)) return
+        if (!looksLikeQuestion(src) && !looksLikeQuestion(tgt)) return
         val key = text.replace(Regex("[\\s，。？！,.?!]"), "")
         val now = System.currentTimeMillis()
         val last = askedQuestions[key]
@@ -1807,14 +1818,14 @@ class LiveController(private val app: App) {
     fun recap(minutes: Int = 5) {
         scope.launch {
             val st = _state.value
-            if (!st.running || st.assistantBusy) return@launch
+            val sessionAtStart = st.sessionId ?: return@launch
+            if (st.assistantBusy || st.segments.isEmpty()) return@launch
             val cutoff = st.segments.lastOrNull()?.t1?.minus(minutes * 60.0)
             val items = st.segments.filter { cutoff == null || it.t1 >= cutoff }.takeLast(12)
                 .ifEmpty { st.segments.takeLast(10) }
             if (items.isEmpty()) return@launch
-            val sessionAtStart = st.sessionId
             analysisMutex.withLock {
-                if (_state.value.sessionId != sessionAtStart || !_state.value.running) return@launch
+                if (_state.value.sessionId != sessionAtStart) return@launch
                 _state.update { it.copy(assistantBusy = true) }
                 val body = items.joinToString("\n") { "- ${it.src} / ${it.tgt}" }
                 val sb = StringBuilder()
@@ -1828,6 +1839,9 @@ class LiveController(private val app: App) {
                     val finalText = (result ?: sb.toString()).trim()
                     if (finalText.isNotBlank() && _state.value.sessionId == sessionAtStart) {
                         _state.update { it.copy(summary = finalText) }
+                        runCatching {
+                            withContext(Dispatchers.IO) { app.db.addSummary(sessionAtStart, finalText) }
+                        }
                     } else if (result == null && _state.value.sessionId == sessionAtStart && _state.value.summary.isBlank()) {
                         _state.update { it.copy(summary = "助教模型未就绪，请到设置下载助教模型或配置 API。") }
                     }
@@ -1922,7 +1936,12 @@ class LiveController(private val app: App) {
             runCatching { capture?.stop() }
             capture = null
             partialInFlight = false
-            _state.update { it.copy(starting = false, running = false, stopping = false, status = "已结束") }
+            _state.update {
+                it.copy(
+                    starting = false, running = false, stopping = false,
+                    status = "已结束", audioLevel = 0f, speaking = false,
+                )
+            }
             stopping = false
             return
         }
@@ -1950,7 +1969,7 @@ class LiveController(private val app: App) {
             AppLog.d("Live", "结束会话 id=$sid segments=${_state.value.segments.size} pendingFinal=${finalPending.get()} pendingTranslate=${translatePending.get()}")
             if (sid != null) {
                 val segments = _state.value.segments
-                val first = segments.firstOrNull()
+                val first = segments.firstOrNull { it.id > 0 }
                 val busy = finalPending.get() > 0 || translatePending.get() > 0
                 if (first == null) {
                     if (busy) {
@@ -1980,7 +1999,8 @@ class LiveController(private val app: App) {
             _state.update {
                 it.copy(
                     running = false, starting = false, stopping = false, paused = false,
-                    status = "已结束", speaking = false, partialSrc = "", partialTgt = "",
+                    status = "已结束", speaking = false, audioLevel = 0f,
+                    partialSrc = "", partialTgt = "", partialDraft = false,
                 )
             }
             stopping = false
@@ -1992,7 +2012,8 @@ class LiveController(private val app: App) {
             _state.update {
                 it.copy(
                     running = false, starting = false, stopping = false, paused = false,
-                    status = "已结束（收尾异常）", speaking = false,
+                    status = "已结束（收尾异常）", speaking = false, audioLevel = 0f,
+                    partialSrc = "", partialTgt = "", partialDraft = false,
                     error = "结束会话时出错：${t.message?.take(80) ?: "未知错误"}",
                 )
             }
@@ -2041,6 +2062,9 @@ class LiveController(private val app: App) {
                     }.onFailure { AppLog.e("Live", "保存自动术语失败", it) }
                 }
             }
+            if (settings.cloudAutoSync && settings.cloudSyncUrl.isNotBlank()) {
+                app.cloudSync.syncNow()
+            }
         } catch (_: Throwable) {
         }
     }
@@ -2054,6 +2078,7 @@ class LiveController(private val app: App) {
             val segs = app.db.listSegments(sessionId)
             if (segs.isEmpty()) return
             val speakers = app.db.listSpeakers(sessionId).associateBy { it.id }
+            val bookmarkedIds = app.db.listBookmarks(sessionId).map { it.segmentId }.toSet()
             val questions = app.db.listQuestions(sessionId).map { q ->
                 LiveQuestion(
                     id = q.id,
@@ -2102,6 +2127,7 @@ class LiveController(private val app: App) {
                         lowConfidence = g.lowConfidence,
                         audioPath = g.audioPath,
                         speakerId = g.speakerId,
+                        bookmarked = g.id in bookmarkedIds,
                     )
                 },
                 summary = summary,
@@ -2123,7 +2149,7 @@ class LiveController(private val app: App) {
         if (st.running || st.starting || translatePending.get() > 0) return
         val sid = st.sessionId ?: return
         val missing = st.segments.filter {
-            it.tgt.isBlank() || it.tgt.startsWith("（翻译失败") || it.tgt.startsWith("（未翻译")
+            it.id > 0 && (it.tgt.isBlank() || it.tgt.startsWith("（翻译失败") || it.tgt.startsWith("（未翻译"))
         }
         if (missing.isEmpty()) return
         val config = app.settings.value
@@ -2133,11 +2159,12 @@ class LiveController(private val app: App) {
             translatePending.incrementAndGet()
             translateChannel.trySend(
                 TranslateJob(
-                    sid, seg.id, seg.src, seg.srcLang, SystemClock.elapsedRealtime(),
-                    target, glossaryText, courseId, config,
+                    sid, seg.id, seg.src, seg.srcLang.ifBlank { guessLanguage(seg.src) },
+                    SystemClock.elapsedRealtime(), target, glossaryText, courseId, config,
                 )
             )
         }
+        refreshPendingQueue()
         draftGeneration++
         translationEpoch++
         _state.update { it.copy(status = "正在补译 ${missing.size} 句…") }
@@ -2191,16 +2218,10 @@ class LiveController(private val app: App) {
         }
     }
 
-    fun bookmark(): Boolean = bookmarkSegment(null)
-
-    fun bookmarkSegment(segmentId: Long? = null): Boolean {
+    fun bookmark(): Boolean {
         val st = _state.value
         val sid = st.sessionId ?: return false
-        val seg = if (segmentId != null) {
-            st.segments.firstOrNull { it.id == segmentId && it.id > 0 }
-        } else {
-            st.segments.lastOrNull { it.id > 0 }
-        } ?: return false
+        val seg = st.segments.lastOrNull { it.id > 0 } ?: return false
         if (!seg.bookmarked) {
             _state.update { cur ->
                 cur.copy(segments = cur.segments.map {
@@ -2213,6 +2234,25 @@ class LiveController(private val app: App) {
             }
         }
         return true
+    }
+
+    /** 切换单句的书签状态；返回切换后的状态（true=已标记，false=已取消），找不到句子返回 null。 */
+    fun toggleBookmarkSegment(segmentId: Long): Boolean? {
+        val st = _state.value
+        val sid = st.sessionId ?: return null
+        val seg = st.segments.firstOrNull { it.id == segmentId && it.id > 0 } ?: return null
+        val next = !seg.bookmarked
+        _state.update { cur ->
+            cur.copy(segments = cur.segments.map {
+                if (it.id == seg.id) it.copy(bookmarked = next) else it
+            })
+        }
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                if (next) app.db.addBookmark(sid, seg.id) else app.db.removeBookmark(sid, seg.id)
+            }.onFailure { AppLog.e("Live", "更新标记失败", it) }
+        }
+        return next
     }
 
     fun updateAssistantEnabled(enabled: Boolean) {
@@ -2330,19 +2370,8 @@ class LiveController(private val app: App) {
         }
     }
 
-    private fun guessLanguage(text: String): String {
-        val kana = text.count { it in '\u3040'..'\u30FF' }
-        val hangul = text.count { it in '\uAC00'..'\uD7A3' }
-        val cjk = text.count { it in '\u4E00'..'\u9FFF' }
-        val latin = text.count { it in 'a'..'z' || it in 'A'..'Z' }
-        return when {
-            kana >= 2 -> "ja"
-            hangul >= 2 -> "ko"
-            cjk > latin && cjk > 0 -> "zh"
-            latin > cjk && latin > 0 -> "en"
-            else -> ""
-        }
-    }
+    private fun guessLanguage(text: String): String =
+        com.localinterpreter.tablet.llm.Langs.guessLanguage(text)
 
     /**
      * 过滤 SenseVoice 在无人说话或轻微环境杂音（空调、翻页、敲击、远场底噪）下产生的乱码与固定幻觉。
@@ -2431,12 +2460,18 @@ class LiveController(private val app: App) {
     }
 
     private fun looksLikeQuestion(text: String): Boolean {
-        if (text.contains("？") || text.contains("?")) return true
+        val t = text.trim()
+        if (t.isEmpty()) return false
+        if (t.contains("？") || t.contains("?")) return true
         val marks = listOf("吗", "呢", "为什么", "为何", "如何", "是否", "谁", "哪里", "哪种", "多少", "几个", "几种", "能不能", "可不可以", "有没有", "是不是")
-        return marks.any { text.contains(it) }
+        if (marks.any { t.contains(it) }) return true
+        return EN_QUESTION_REGEX.containsMatchIn(t.lowercase())
     }
 
     companion object {
+        private val EN_QUESTION_REGEX = Regex(
+            "^\\s*(so |and |but )?(what|why|how|when|where|who|which|can|could|should|do|does|did|is|are|will|would)\\b"
+        )
         private val speakerColors = listOf("#4fd1a5", "#7aa2ff", "#f0b45c", "#e07ad1", "#8bd46a", "#f07070")
         /** 小于 0.4 秒（16k 采样）的 VAD 片段先攒着，与下一句合并后再识别。 */
         private const val MIN_SEGMENT_SAMPLES = 6400

@@ -7,6 +7,7 @@ import com.localinterpreter.tablet.data.Settings
 import com.localinterpreter.tablet.llm.LlmService
 import com.localinterpreter.tablet.llm.ModelStore
 import com.localinterpreter.tablet.live.LiveController
+import com.localinterpreter.tablet.sync.CloudSyncClient
 import com.localinterpreter.tablet.util.AppLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -25,6 +26,8 @@ class App : Application() {
     lateinit var llm: LlmService
         private set
     lateinit var live: LiveController
+        private set
+    lateinit var cloudSync: CloudSyncClient
         private set
 
     /** 课程导入、导出等需要跨页面完成的工作。 */
@@ -52,6 +55,7 @@ class App : Application() {
         models = ModelStore(this)
         repo = Repository(this, db)
         llm = LlmService(this)
+        cloudSync = CloudSyncClient(this, db, settings)
         live = LiveController(this)
         // 恢复长课次可能读取大量字幕，放到 IO 线程，避免拖慢冷启动首帧。
         appScope.launch {

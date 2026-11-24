@@ -430,13 +430,12 @@ class Repository(private val context: Context, private val db: Database) {
     fun storageInfo(): StorageInfo {
         val dbFile = context.getDatabasePath("history.db")
         val models = File(context.filesDir, "models")
-        val stat = StatFs(context.filesDir.absolutePath)
         return StorageInfo(
             databaseBytes = dbFile.length(),
             audioBytes = dirSize(audioRoot),
             materialBytes = dirSize(materialRoot),
             modelBytes = dirSize(models),
-            freeBytes = stat.availableBytes,
+            freeBytes = freeBytes().takeIf { it != Long.MAX_VALUE } ?: 0L,
         )
     }
 

@@ -290,8 +290,9 @@ fun MainScreen(
                             OverlayService.stop(context)
                             toast("浮字幕已关闭")
                         } else {
-                            OverlayService.start(context)
-                            toast("浮字幕已开启")
+                            runCatching { OverlayService.start(context) }
+                                .onSuccess { toast("浮字幕已开启") }
+                                .onFailure { toast("浮字幕启动失败：${it.message?.take(60) ?: "系统限制"}") }
                         }
                     }
                 },
@@ -965,7 +966,11 @@ private fun TranscriptPane(
                         )
                         Spacer(Modifier.width(8.dp))
                         Pill(
-                            text = "${Langs.name(settings.sourceLang)} → ${Langs.name(settings.targetLang)}",
+                            text = if (settings.sourceLang == "auto" && settings.targetLang == "auto") {
+                                "语言：自动识别 ⇄ 中英互译"
+                            } else {
+                                "${Langs.displayName(settings.sourceLang)} → ${Langs.displayName(settings.targetLang)}"
+                            },
                             color = c.secondary,
                             onClick = {
                                 val (nextSrc, nextTgt) = swapLanguagePair(settings.sourceLang, settings.targetLang)
@@ -1117,8 +1122,13 @@ private fun TranscriptPane(
                         canAddGlossary = live.courseId != null,
                         onBookmark = if (seg.id > 0) {
                             {
-                                if (app.live.bookmarkSegment(seg.id)) {
-                                    Toast.makeText(context, "已标记该句", Toast.LENGTH_SHORT).show()
+                                val nowMarked = app.live.toggleBookmarkSegment(seg.id)
+                                if (nowMarked != null) {
+                                    Toast.makeText(
+                                        context,
+                                        if (nowMarked) "已标记该句" else "已取消标记",
+                                        Toast.LENGTH_SHORT,
+                                    ).show()
                                 }
                             }
                         } else null,
@@ -1830,10 +1840,14 @@ fun AssistantPane(
                 return@Column
             }
 
+            val modelProgress by app.models.progress.collectAsStateWithLifecycle()
+            val assistantReady = remember(modelProgress, settings.assistantVariant) {
+                app.models.assistantReady(settings.assistantVariant)
+            }
             val analysisApiReady = settings.analysisMode == SettingsData.MODE_API &&
                 (settings.analysisBaseUrl.ifBlank { settings.apiBaseUrl }).isNotBlank() &&
                 (settings.analysisModel.ifBlank { settings.apiModel }).isNotBlank()
-            if (settings.analysisMode == SettingsData.MODE_BUILTIN && !app.models.assistantReady(settings.assistantVariant)) {
+            if (settings.analysisMode == SettingsData.MODE_BUILTIN && !assistantReady) {
                 Spacer(Modifier.height(10.dp))
                 Row(
                     Modifier

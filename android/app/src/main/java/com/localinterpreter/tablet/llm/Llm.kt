@@ -75,6 +75,25 @@ object Langs {
         else -> code
     }
 
+    fun displayName(code: String): String = when (code) {
+        "auto" -> "自动"
+        else -> name(code)
+    }
+
+    fun guessLanguage(text: String): String {
+        val kana = text.count { it in '\u3040'..'\u30FF' }
+        val hangul = text.count { it in '\uAC00'..'\uD7A3' }
+        val cjk = text.count { it in '\u4E00'..'\u9FFF' }
+        val latin = text.count { it in 'a'..'z' || it in 'A'..'Z' }
+        return when {
+            kana >= 2 -> "ja"
+            hangul >= 2 -> "ko"
+            cjk > 0 && cjk * 4 >= latin -> "zh"
+            latin > 0 -> "en"
+            else -> ""
+        }
+    }
+
     fun resolveTarget(detected: String, target: String): String {
         if (target != "auto") return target
         return if (detected.startsWith("zh") || detected.startsWith("yue")) "en" else "zh"
@@ -124,9 +143,18 @@ object Prompts {
 /** 去掉思考模型输出的 <think>…</think> 片段；流式时也不能把思考过程打到字幕上。 */
 object Think {
     private val block = Regex("<think[^>]*>.*?(?:</think[^>]*>|<｜end▁of▁thinking｜>|$)", RegexOption.DOT_MATCHES_ALL)
+    private val orphanEnd = Regex("^.*?(?:</think[^>]*>|<｜end▁of▁thinking｜>)", RegexOption.DOT_MATCHES_ALL)
     private val tag = Regex("</?think[^>]*>|<｜end▁of▁thinking｜>")
 
-    fun strip(text: String): String = tag.replace(block.replace(text, ""), "").trim()
+    fun strip(text: String): String {
+        var s = block.replace(text, "")
+        // 部分服务端模板已把 <think> 拼进 prompt，模型只吐出「思考内容</think>正文」；
+        // 去掉孤立结束标签及之前残留的思考段落，只保留最终正文。
+        if (s.contains("</think") || s.contains("<｜end▁of▁thinking｜>")) {
+            s = orphanEnd.replaceFirst(s, "")
+        }
+        return tag.replace(s, "").trim()
+    }
 }
 
 class ThinkStreamFilter {
@@ -351,10 +379,6 @@ class ApiLlm(
     private val model: String,
     private val apiKey: String,
 ) {
-    private val client = sharedClient
-    // 流式请求若长时间收不到任何字节，尽快失败并切换到非流式请求，而不是一直等到 180 秒。
-    private val streamClient by lazy { sharedClient.newBuilder().readTimeout(20, TimeUnit.SECONDS).build() }
-    private val blockingClient by lazy { sharedClient.newBuilder().readTimeout(90, TimeUnit.SECONDS).build() }
     private val active = AtomicReference<Call?>(null)
 
     fun cancel() {
@@ -404,7 +428,7 @@ class ApiLlm(
                     .post(requestBody(disableThinking).toRequestBody("application/json".toMediaType()))
                     .apply { if (apiKey.isNotBlank()) header("Authorization", "Bearer $apiKey") }
                     .build()
-                val call = (if (stream) streamClient else blockingClient).newCall(request)
+                val call = (if (stream) sharedStreamClient else sharedBlockingClient).newCall(request)
                 AppLog.d(
                     "LLM-API",
                     "POST url=$url model=${model.ifBlank { "default" }} stream=$stream " +
@@ -488,7 +512,7 @@ class ApiLlm(
         var finishReason = ""
         if (!contentType.contains("event-stream", ignoreCase = true)) {
             val whole = source.readString(Charsets.UTF_8)
-            raw.append(whole)
+            raw.append(whole.take(4096))
             val text = parseCompletion(whole)
                 .ifBlank { parseSseText(whole) }
                 .ifBlank { parseJsonLines(whole) }
@@ -516,7 +540,7 @@ class ApiLlm(
         while (!source.exhausted()) {
             if (isCancelled()) throw CancellationException("cancelled")
             val line = source.readUtf8Line() ?: break
-            raw.append(line).append('\n')
+            if (raw.length < 4096) raw.append(line).append('\n')
             if (!line.startsWith("data:")) continue
             val data = line.removePrefix("data:").trim()
             if (data == "[DONE]") break
@@ -591,6 +615,16 @@ class ApiLlm(
                 .connectTimeout(10, TimeUnit.SECONDS)
                 .readTimeout(180, TimeUnit.SECONDS)
                 .build()
+        }
+        // 流式请求若长时间收不到任何字节，尽快失败并切换到非流式请求，而不是一直等到 180 秒。
+        private val sharedStreamClient: OkHttpClient by lazy {
+            sharedClient.newBuilder().readTimeout(20, TimeUnit.SECONDS).build()
+        }
+        private val sharedBlockingClient: OkHttpClient by lazy {
+            sharedClient.newBuilder().readTimeout(90, TimeUnit.SECONDS).build()
+        }
+        private val sharedProbeClient: OkHttpClient by lazy {
+            sharedClient.newBuilder().connectTimeout(5, TimeUnit.SECONDS).readTimeout(10, TimeUnit.SECONDS).build()
         }
 
         fun normalizeBase(url: String): String {
@@ -687,10 +721,6 @@ class ApiLlm(
         }
 
         fun listModels(baseUrl: String, apiKey: String): List<String> {
-            val client = sharedClient.newBuilder()
-                .connectTimeout(5, TimeUnit.SECONDS)
-                .readTimeout(10, TimeUnit.SECONDS)
-                .build()
             var base = normalizeBase(baseUrl)
             if (base.isBlank()) return emptyList()
             if (base.endsWith("/chat/completions")) base = base.removeSuffix("/chat/completions")
@@ -700,14 +730,16 @@ class ApiLlm(
                 val req = Request.Builder().url(url)
                     .apply { if (apiKey.isNotBlank()) header("Authorization", "Bearer $apiKey") }
                     .build()
-                val result = client.newCall(req).execute().use { resp ->
+                val result = sharedProbeClient.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) return@use null
                     val text = resp.body?.string() ?: return@use null
-                    JSONObject(text).optJSONArray("data")?.let { arr ->
-                        (0 until arr.length()).mapNotNull {
-                            arr.optJSONObject(it)?.optString("id")?.takeIf { id -> id.isNotBlank() }
+                    runCatching {
+                        JSONObject(text).optJSONArray("data")?.let { arr ->
+                            (0 until arr.length()).mapNotNull {
+                                arr.optJSONObject(it)?.optString("id")?.takeIf { id -> id.isNotBlank() }
+                            }
                         }
-                    }
+                    }.getOrNull()
                 }
                 if (result != null) return result
             }
@@ -1196,10 +1228,18 @@ class LlmService(private val app: App) {
                     apiTranslatorCalls.remove(api)
                 }
             } else {
-                val llm = localTranslator() ?: return null
-                translatorLock.withLock {
-                    if (!llm.ensureLoaded()) return null
-                    withTimeout(30_000) { llm.generate(Prompts.CORRECT, user, 200, 0.1f) }
+                // 若助教指令模型已加载，优先由助教执行同音字校正，避免破坏翻译模型的 KV Prefix Cache。
+                val loadedAssistant = assistant?.takeIf { it.loaded }
+                if (loadedAssistant != null) {
+                    assistantLock.withLock {
+                        withTimeout(30_000) { loadedAssistant.generate(Prompts.CORRECT, user, 200, 0.1f) }
+                    }
+                } else {
+                    val llm = localTranslator() ?: return null
+                    translatorLock.withLock {
+                        if (!llm.ensureLoaded()) return null
+                        withTimeout(30_000) { llm.generate(Prompts.CORRECT, user, 200, 0.1f) }
+                    }
                 }
             }
         } catch (_: Throwable) {
@@ -1223,10 +1263,13 @@ class LlmService(private val app: App) {
 
     @Synchronized
     fun unloadTranslator() {
+        warmUpJob?.cancel()
+        warmUpJob = null
         val old = translator
         translator = null
         translatorPath = ""
         translatorThreads = 0
+        translatorUseGpu = false
         _translatorStatus.value = "未加载"
         old?.let { closeInBackground(it) }
     }
@@ -1237,6 +1280,7 @@ class LlmService(private val app: App) {
         assistant = null
         assistantPath = ""
         assistantThreads = 0
+        assistantUseGpu = false
         _assistantStatus.value = "未加载"
         old?.let { closeInBackground(it) }
     }
@@ -1253,6 +1297,8 @@ class LlmService(private val app: App) {
 
     @Synchronized
     fun unloadAll() {
+        warmUpJob?.cancel()
+        warmUpJob = null
         val t = translator
         val a = assistant
         translator = null
@@ -1261,6 +1307,8 @@ class LlmService(private val app: App) {
         assistantPath = ""
         translatorThreads = 0
         assistantThreads = 0
+        translatorUseGpu = false
+        assistantUseGpu = false
         _translatorStatus.value = "未加载"
         _assistantStatus.value = "未加载"
         t?.let { closeInBackground(it) }

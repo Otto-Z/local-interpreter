@@ -89,6 +89,57 @@ internal class StreamResampler(private val from: Int, private val to: Int) {
         phase = pos - n
         return if (outIdx == out.size) out else out.copyOf(outIdx)
     }
+
+    fun processFloat(src: FloatArray, n: Int = src.size): FloatArray {
+        if (n <= 0 || from <= 0 || to <= 0) return FloatArray(0)
+        if (from == to) return if (n == src.size) src else src.copyOf(n)
+        if (exactRatio > 1) {
+            val total = accCount + n
+            val outLen = total / exactRatio
+            val out = FloatArray(outLen)
+            var outIdx = 0
+            var sum = accSum
+            var cnt = accCount
+            val invScale = 1.0 / exactRatio
+            for (i in 0 until n) {
+                sum += src[i].toDouble()
+                cnt++
+                if (cnt == exactRatio) {
+                    out[outIdx++] = (sum * invScale).toFloat()
+                    sum = 0.0
+                    cnt = 0
+                }
+            }
+            accSum = sum
+            accCount = cnt
+            return out
+        }
+        val step = from.toDouble() / to.toDouble()
+        val estOut = ((n / step) + 4).toInt().coerceAtLeast(1)
+        val out = FloatArray(estOut)
+        var outIdx = 0
+        var pos = phase
+        while (pos < n) {
+            val sample = if (pos < 0.0) {
+                val frac = pos + 1.0
+                val s0 = if (hasPrev) prevSample else src[0]
+                val s1 = src[0]
+                (s0 * (1.0 - frac) + s1 * frac).toFloat()
+            } else {
+                val idx = pos.toInt()
+                val next = idx + 1
+                if (next >= n) break
+                val frac = pos - idx
+                (src[idx] * (1.0 - frac) + src[next] * frac).toFloat()
+            }
+            if (outIdx < out.size) out[outIdx++] = sample
+            pos += step
+        }
+        prevSample = src[n - 1]
+        hasPrev = true
+        phase = pos - n
+        return if (outIdx == out.size) out else out.copyOf(outIdx)
+    }
 }
 
 class MicCapture(
@@ -323,6 +374,14 @@ class SystemAudioCapture(
             callback = null
             runCatching { rec.release() }
             throw RuntimeException("系统音频启动失败：${t.message ?: "请确认录屏授权"}", t)
+        }
+        if (rec.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            running = false
+            record = null
+            runCatching { projection.unregisterCallback(cb) }
+            callback = null
+            runCatching { rec.release() }
+            throw RuntimeException("系统音频未进入录制状态：请确认录屏授权且没有其它应用独占内录")
         }
         thread = thread(name = "system-audio-capture", isDaemon = true) {
             AppLog.d("Audio", "系统音频采集开始 capture=$captureRate actual=$actualRate buf=$bufSize")

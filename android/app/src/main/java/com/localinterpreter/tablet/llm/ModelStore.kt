@@ -259,6 +259,7 @@ class ModelStore(private val context: Context) {
                 }
             } finally {
                 calls.remove(kind.id)
+                jobs.remove(kind.id, currentCoroutineContext()[Job])
             }
         }
     }
@@ -302,16 +303,22 @@ class ModelStore(private val context: Context) {
     }
 
     /** 只取响应头里的 ETag（回退 Last-Modified）；失败返回 null，调用方按「无法校验」处理（仍可续传）。 */
-    private fun headVersionStamp(url: String): String? {
+    private fun headVersionStamp(kind: ModelKind, url: String): String? {
         val request = Request.Builder()
             .url(url)
             .head()
             .header("User-Agent", "LocalInterpreterTablet/1.0")
             .build()
-        return client.newCall(request).execute().use { resp ->
-            if (!resp.isSuccessful) null
-            else resp.header("ETag")?.takeIf { it.isNotBlank() }
-                ?: resp.header("Last-Modified")?.takeIf { it.isNotBlank() }
+        val call = client.newCall(request)
+        calls[kind.id] = call
+        return try {
+            call.execute().use { resp ->
+                if (!resp.isSuccessful) null
+                else resp.header("ETag")?.takeIf { it.isNotBlank() }
+                    ?: resp.header("Last-Modified")?.takeIf { it.isNotBlank() }
+            }
+        } finally {
+            calls.remove(kind.id, call)
         }
     }
 
@@ -341,7 +348,7 @@ class ModelStore(private val context: Context) {
                 // 续传前校验远端版本：上游换了文件还接着旧断点拼，会得到「能下完但加载失败」的模型。
                 val savedEtag = if (existing > 0) runCatching { stamp.readText() }.getOrNull().orEmpty() else ""
                 if (existing > 0 && savedEtag.isNotBlank()) {
-                    val remoteEtag = runCatching { headVersionStamp(url) }.getOrNull().orEmpty()
+                    val remoteEtag = runCatching { headVersionStamp(kind, url) }.getOrNull().orEmpty()
                     if (remoteEtag.isNotBlank() && remoteEtag != savedEtag) {
                         AppLog.d("Model", "远端模型已更新，丢弃旧断点 ${tmp.length() / 1_048_576}MB $name")
                         tmp.delete()

@@ -1,6 +1,6 @@
 # 从 GitHub 重建这份项目
 
-仓库：https://github.com/Otto-Z/local-interpreter （私有）
+仓库：https://github.com/Otto-Z/local-interpreter （Apache-2.0 开源）
 
 ## 一句话结论
 

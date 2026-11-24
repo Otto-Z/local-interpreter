@@ -52,16 +52,13 @@ def extract_chunks(path: Path) -> list[tuple[int, str]]:
     suffix = path.suffix.lower()
     pages: list[tuple[int, str]] = []
     if suffix == ".pdf":
-        import pymupdf
+        from pypdf import PdfReader
 
-        doc = pymupdf.open(str(path))
-        try:
-            for index, page in enumerate(doc):
-                text = page.get_text("text").strip()
-                if text:
-                    pages.append((index + 1, text))
-        finally:
-            doc.close()
+        reader = PdfReader(str(path))
+        for index, page in enumerate(reader.pages):
+            text = (page.extract_text() or "").strip()
+            if text:
+                pages.append((index + 1, text))
         # 有些扫描件只带一行水印文字，文字层很短时也走 OCR
         if not pages or sum(len(text) for _, text in pages) < 40:
             ocr_pages = _ocr_pdf(path)

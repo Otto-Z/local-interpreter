@@ -9,6 +9,6 @@ sherpa-onnx
 pypinyin
 mlx-audio
 mlx-lm
-pymupdf
+pypdf
 python-docx
 python-multipart

@@ -68,10 +68,11 @@ android {
 
     signingConfigs {
         create("release") {
-            storeFile = file("localinterpreter.jks")
-            storePassword = "localinterpreter"
-            keyAlias = "localinterpreter"
-            keyPassword = "localinterpreter"
+            // 默认使用公开社区构建密钥以保持开源版本覆盖升级一致；独立发版请通过环境变量注入私有 keystore。
+            storeFile = file(System.getenv("ANDROID_KEYSTORE_PATH") ?: "localinterpreter.jks")
+            storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD") ?: "localinterpreter"
+            keyAlias = System.getenv("ANDROID_KEY_ALIAS") ?: "localinterpreter"
+            keyPassword = System.getenv("ANDROID_KEY_PASSWORD") ?: "localinterpreter"
         }
     }
 

@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "core/crates/core-model",
+    "core/crates/core-storage",
+    "core/crates/core-dsp",
+    "core/crates/core-inference",
+    "core/crates/core-pipeline",
+    "core/crates/core-sync",
+    "core/crates/core-ffi",
+    "cloud",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+flate2 = "1.0"
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+pbkdf2 = "0.12"
+rand = "0.8"
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "multipart"] }
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.41", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uniffi = { version = "0.28", features = ["cli"] }
+uuid = { version = "1.11", features = ["v7", "v4", "v5", "serde"] }
+
+core-model = { path = "core/crates/core-model" }
+core-storage = { path = "core/crates/core-storage" }
+core-dsp = { path = "core/crates/core-dsp" }
+core-inference = { path = "core/crates/core-inference" }
+core-pipeline = { path = "core/crates/core-pipeline" }
+core-sync = { path = "core/crates/core-sync" }

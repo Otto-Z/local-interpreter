@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="同传知识点" />
+  <meta name="theme-color" content="#0b0f17" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <title>离线同传 · 知识点复习</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --card: #ffffff;
+      --text: #111827;
+      --muted: #6b7280;
+      --border: #e5e7eb;
+      --accent: #2563eb;
+      --accent-soft: rgba(37, 99, 235, 0.12);
+      --gold: #f59e0b;
+      --danger: #ef4444;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b0f17;
+        --card: #141b27;
+        --text: #f3f4f6;
+        --muted: #9ca3af;
+        --border: #243044;
+        --accent: #60a5fa;
+        --accent-soft: rgba(96, 165, 250, 0.16);
+      }
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: calc(76px + env(safe-area-inset-bottom));
+    }
+    header {
+      position: sticky; top: 0; z-index: 20;
+      background: color-mix(in srgb, var(--bg) 88%, transparent);
+      backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      padding: 14px 16px 10px;
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    }
+    header h1 { margin: 0; font-size: 19px; font-weight: 700; letter-spacing: -0.02em; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: var(--accent-soft); color: var(--accent);
+      padding: 5px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+      border: none; cursor: pointer;
+    }
+    main { max-width: 720px; margin: 0 auto; padding: 14px 14px 24px; }
+    .chips { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 10px; scrollbar-width: none; }
+    .chips::-webkit-scrollbar { display: none; }
+    .chip {
+      flex: 0 0 auto; padding: 7px 13px; border-radius: 999px;
+      border: 1px solid var(--border); background: var(--card); color: var(--text);
+      font-size: 13px; font-weight: 500; cursor: pointer;
+    }
+    .chip.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 16px; padding: 15px; margin-bottom: 12px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.03);
+    }
+    .card-title { font-size: 16px; font-weight: 700; margin: 0 0 6px; line-height: 1.35; }
+    .meta { font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+    .body { font-size: 14px; line-height: 1.65; color: var(--text); white-space: pre-wrap; }
+    .quote {
+      margin-top: 8px; padding: 8px 10px; border-left: 3px solid var(--accent);
+      background: var(--accent-soft); border-radius: 0 8px 8px 0;
+      font-size: 12.5px; color: var(--muted);
+    }
+    .stars { color: var(--gold); letter-spacing: 1px; font-size: 13px; }
+    .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .tag { font-size: 11px; padding: 2px 8px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); }
+    .flashcard {
+      min-height: 220px; display: flex; flex-direction: column; justify-content: center;
+      align-items: center; text-align: center; cursor: pointer; user-select: none;
+      transition: transform 0.15s ease;
+    }
+    .flashcard:active { transform: scale(0.98); }
+    .fc-term { font-size: 24px; font-weight: 800; margin-bottom: 10px; }
+    .fc-trans { font-size: 18px; color: var(--accent); font-weight: 600; margin-bottom: 8px; }
+    .fc-note { font-size: 14px; color: var(--muted); max-width: 90%; }
+    .row { display: flex; gap: 10px; align-items: center; justify-content: space-between; }
+    .btn {
+      padding: 10px 14px; border-radius: 12px; border: 1px solid var(--border);
+      background: var(--card); color: var(--text); font-size: 14px; font-weight: 600;
+      cursor: pointer; flex: 1;
+    }
+    .btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    input, textarea {
+      width: 100%; padding: 11px 13px; border-radius: 12px;
+      border: 1px solid var(--border); background: var(--card); color: var(--text);
+      font-size: 15px; font-family: inherit;
+    }
+    textarea { min-height: 84px; resize: vertical; }
+    nav {
+      position: fixed; bottom: 0; left: 0; right: 0; z-index: 30;
+      background: color-mix(in srgb, var(--card) 92%, transparent);
+      backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      border-top: 1px solid var(--border);
+      padding: 6px 8px calc(8px + env(safe-area-inset-bottom));
+      display: grid; grid-template-columns: repeat(4, 1fr);
+    }
+    nav button {
+      border: none; background: transparent; color: var(--muted);
+      font-size: 11px; font-weight: 600; padding: 6px 4px;
+      display: flex; flex-direction: column; align-items: center; gap: 3px; cursor: pointer;
+    }
+    nav button .ico { font-size: 19px; line-height: 1; }
+    nav button.active { color: var(--accent); }
+    .seg-item { padding: 10px 0; border-bottom: 1px solid var(--border); }
+    .seg-item:last-child { border-bottom: none; }
+    .seg-src { font-size: 13px; color: var(--muted); margin-bottom: 3px; }
+    .seg-tgt { font-size: 14.5px; font-weight: 500; }
+    .empty { text-align: center; padding: 48px 20px; color: var(--muted); font-size: 14px; }
+    .modal {
+      position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,0.55);
+      display: flex; align-items: center; justify-content: center; padding: 20px;
+    }
+    .modal-box { background: var(--card); border-radius: 18px; padding: 20px; width: 100%; max-width: 380px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>同传知识点</h1>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <button class="pill" id="syncBtn" onclick="refreshAll()">↻ 同步</button>
+      <button class="pill" onclick="openAuthModal()">🔑</button>
+    </div>
+  </header>
+
+  <main id="app"></main>
+
+  <nav>
+    <button class="active" data-tab="knowledge" onclick="switchTab('knowledge')"><span class="ico">✨</span>知识点</button>
+    <button data-tab="sessions" onclick="switchTab('sessions')"><span class="ico">📚</span>课次</button>
+    <button data-tab="flashcards" onclick="switchTab('flashcards')"><span class="ico">🃏</span>术语卡</button>
+    <button data-tab="search" onclick="switchTab('search')"><span class="ico">🔍</span>搜索</button>
+  </nav>
+
+  <div id="authModal" class="modal" style="display:none;">
+    <div class="modal-box">
+      <h3 style="margin:0 0 8px;">连接 Google Cloud 同步</h3>
+      <p style="margin:0 0 12px;font-size:13px;color:var(--muted);">输入与 Mac / 平板一致的 Sync Token（若服务端未启用鉴权可留空）。</p>
+      <input id="tokenInput" type="password" placeholder="SYNC_AUTH_TOKEN" />
+      <div class="row" style="margin-top:14px;">
+        <button class="btn" onclick="closeAuthModal()">取消</button>
+        <button class="btn primary" onclick="saveToken()">保存并同步</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      tab: 'knowledge',
+      courseId: 'all',
+      data: { courses: [], sessions: [], glossary: [], bookmarks: [], questions: [] },
+      activeSession: null,
+      fcIndex: 0,
+      fcFlipped: false,
+      searchResults: [],
+      searchQuery: '',
+      offline: false,
+    };
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
+
+    function getToken() { return localStorage.getItem('li_sync_token') || ''; }
+    function headers() {
+      const h = { 'Content-Type': 'application/json' };
+      const t = getToken();
+      if (t) h['Authorization'] = 'Bearer ' + t;
+      return h;
+    }
+
+    function openAuthModal() {
+      document.getElementById('tokenInput').value = getToken();
+      document.getElementById('authModal').style.display = 'flex';
+    }
+    function closeAuthModal() { document.getElementById('authModal').style.display = 'none'; }
+    function saveToken() {
+      localStorage.setItem('li_sync_token', document.getElementById('tokenInput').value.trim());
+      closeAuthModal();
+      refreshAll();
+    }
+
+    async function refreshAll() {
+      const btn = document.getElementById('syncBtn');
+      btn.textContent = '同步中…';
+      try {
+        const res = await fetch('/api/v1/knowledge', { headers: headers() });
+        if (res.status === 401 || res.status === 403) {
+          btn.textContent = '需鉴权';
+          openAuthModal();
+          return;
+        }
+        state.data = await res.json();
+        state.offline = false;
+        localStorage.setItem('li_cached_knowledge', JSON.stringify(state.data));
+        btn.textContent = '✓ 已同步';
+        setTimeout(() => { btn.textContent = '↻ 同步'; }, 1800);
+      } catch (_) {
+        const cached = localStorage.getItem('li_cached_knowledge');
+        if (cached) state.data = JSON.parse(cached);
+        state.offline = true;
+        btn.textContent = '离线缓存';
+      }
+      render();
+    }
+
+    function switchTab(tab) {
+      state.tab = tab;
+      state.activeSession = null;
+      document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+      render();
+    }
+
+    function selectCourse(id) { state.courseId = id; state.fcIndex = 0; state.fcFlipped = false; render(); }
+
+    function esc(s) {
+      return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    function fmtTime(ms) {
+      if (!ms) return '';
+      const d = new Date(ms);
+      return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+    }
+
+    function courseChips() {
+      const chips = [`<button class="chip ${state.courseId==='all'?'active':''}" onclick="selectCourse('all')">全部课程</button>`];
+      for (const c of state.data.courses) {
+        chips.push(`<button class="chip ${state.courseId===c.id?'active':''}" onclick="selectCourse('${esc(c.id)}')">${esc(c.name)}</button>`);
+      }
+      return `<div class="chips">${chips.join('')}</div>`;
+    }
+
+    function filteredSessions() {
+      return state.data.sessions.filter(s => state.courseId === 'all' || s.course_id === state.courseId);
+    }
+
+    async function openSession(id) {
+      try {
+        const res = await fetch('/api/v1/sessions/' + encodeURIComponent(id), { headers: headers() });
+        if (res.ok) {
+          state.activeSession = await res.json();
+          render();
+        }
+      } catch (_) {}
+    }
+
+    async function toggleSegBookmark(sessionId, segmentId) {
+      await fetch('/api/v1/bookmarks/toggle', {
+        method: 'POST', headers: headers(),
+        body: JSON.stringify({ session_id: sessionId, segment_id: segmentId, note: 'iPhone 标记' })
+      });
+      await openSession(sessionId);
+    }
+
+    async function saveUserNote(sessionId) {
+      const val = document.getElementById('noteArea').value;
+      const res = await fetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/note`, {
+        method: 'POST', headers: headers(),
+        body: JSON.stringify({ user_note: val })
+      });
+      if (res.ok) {
+        const btn = document.getElementById('saveNoteBtn');
+        btn.textContent = '✓ 已保存到云端';
+        setTimeout(() => { btn.textContent = '保存笔记（将同步回 Mac / 平板）'; }, 1600);
+      }
+    }
+
+    async function runSearch(q) {
+      state.searchQuery = q;
+      if (!q.trim()) { state.searchResults = []; renderSearchResults(); return; }
+      try {
+        const res = await fetch('/api/v1/search?q=' + encodeURIComponent(q), { headers: headers() });
+        if (res.ok) { state.searchResults = await res.json(); renderSearchResults(); }
+      } catch (_) {}
+    }
+
+    function renderSearchResults() {
+      const box = document.getElementById('searchOut');
+      if (!box) return;
+      if (!state.searchQuery.trim()) {
+        box.innerHTML = `<div class="empty">输入关键词，搜索所有课堂知识点、术语、问答和双语字幕。</div>`;
+        return;
+      }
+      if (!state.searchResults.length) {
+        box.innerHTML = `<div class="empty">未找到与「${esc(state.searchQuery)}」相关的内容</div>`;
+        return;
+      }
+      box.innerHTML = state.searchResults.map(h => `
+        <div class="card" ${h.session_id ? `onclick="openSession('${esc(h.session_id)}')" style="cursor:pointer;"` : ''}>
+          <div class="meta"><span class="tag">${esc(h.kind)}</span><span>${fmtTime(h.updated_at)}</span></div>
+          <div class="card-title">${esc(h.title)}</div>
+          <div class="body">${esc(h.snippet)}</div>
+        </div>
+      `).join('');
+    }
+
+    function renderSessionDetail(d) {
+      const s = d.session;
+      const bmSet = new Set((d.bookmarks || []).map(b => b.segment_id));
+      return `
+        <button class="pill" style="margin-bottom:12px;" onclick="state.activeSession=null;render()">← 返回列表</button>
+        <div class="card">
+          <div class="card-title">${esc(s.title || '未命名课次')}</div>
+          <div class="meta"><span>${fmtTime(s.started_at)}</span><span>${s.source_lang} → ${s.target_lang}</span></div>
+          ${s.summary ? `<div class="body">${esc(s.summary)}</div>` : ''}
+        </div>
+        ${(s.knowledge_points || []).length ? `
+          <h3 style="margin:14px 4px 8px;font-size:15px;">✨ 核心知识点</h3>
+          ${s.knowledge_points.map(kp => `
+            <div class="card">
+              <div class="row"><div class="card-title" style="margin:0;">${esc(kp.title)}</div><span class="stars">${'★'.repeat(Math.max(1, Math.min(3, kp.importance||2)))}</span></div>
+              <div class="body" style="margin-top:6px;">${esc(kp.explanation)}</div>
+              ${kp.source_quote ? `<div class="quote">${esc(kp.source_quote)}</div>` : ''}
+            </div>
+          `).join('')}
+        ` : ''}
+        <div class="card">
+          <div class="card-title">📝 我的复习笔记</div>
+          <textarea id="noteArea" placeholder="在手机上补充复习要点，下次 Mac / 平板同步时自动带回…">${esc(s.user_note || '')}</textarea>
+          <button id="saveNoteBtn" class="btn primary" style="margin-top:8px;width:100%;" onclick="saveUserNote('${esc(s.id)}')">保存笔记（将同步回 Mac / 平板）</button>
+        </div>
+        ${(d.segments || []).length ? `
+          <div class="card">
+            <div class="card-title">双语转录（点击 ☆ 收藏重点句）</div>
+            ${d.segments.map(seg => `
+              <div class="seg-item">
+                <div class="row">
+                  <div class="seg-src">${esc(seg.src_text)}</div>
+                  <button class="pill" onclick="toggleSegBookmark('${esc(s.id)}','${esc(seg.id)}')">${bmSet.has(seg.id) ? '★' : '☆'}</button>
+                </div>
+                <div class="seg-tgt">${esc(seg.tgt_text)}</div>
+              </div>
+            `).join('')}
+          </div>
+        ` : ''}
+      `;
+    }
+
+    function render() {
+      const root = document.getElementById('app');
+      if (state.activeSession) {
+        root.innerHTML = renderSessionDetail(state.activeSession);
+        return;
+      }
+
+      if (state.tab === 'knowledge') {
+        const sessions = filteredSessions();
+        const cards = [];
+        for (const s of sessions) {
+          for (const kp of (s.knowledge_points || [])) {
+            cards.push({ session: s, kp });
+          }
+        }
+        root.innerHTML = courseChips() + (cards.length ? cards.map(({session, kp}) => `
+          <div class="card" onclick="openSession('${esc(session.id)}')" style="cursor:pointer;">
+            <div class="row">
+              <div class="card-title" style="margin:0;">${esc(kp.title)}</div>
+              <span class="stars">${'★'.repeat(Math.max(1, Math.min(3, kp.importance||2)))}</span>
+            </div>
+            <div class="meta" style="margin-top:4px;"><span>${esc(session.title || '未命名课次')}</span><span>${fmtTime(session.started_at)}</span></div>
+            <div class="body">${esc(kp.explanation)}</div>
+            ${kp.source_quote ? `<div class="quote">${esc(kp.source_quote)}</div>` : ''}
+            ${(kp.tags || []).length ? `<div class="tags">${kp.tags.map(t => `<span class="tag">#${esc(t)}</span>`).join('')}</div>` : ''}
+          </div>
+        `).join('') : `<div class="empty">还没有同步到知识点。<br/>在 Mac 上完课后点击「同步到 Google Cloud」即可在这里复习。</div>`);
+      } else if (state.tab === 'sessions') {
+        const sessions = filteredSessions();
+        root.innerHTML = courseChips() + (sessions.length ? sessions.map(s => `
+          <div class="card" onclick="openSession('${esc(s.id)}')" style="cursor:pointer;">
+            <div class="card-title">${esc(s.title || '未命名课次')}</div>
+            <div class="meta">
+              <span>${fmtTime(s.started_at)}</span>
+              <span>知识点 ${(s.knowledge_points||[]).length} 条</span>
+            </div>
+            <div class="body">${esc(s.summary || '点击查看详细双语字幕与复习笔记')}</div>
+          </div>
+        `).join('') : `<div class="empty">暂无课次记录</div>`);
+      } else if (state.tab === 'flashcards') {
+        const items = state.data.glossary.filter(g => state.courseId === 'all' || g.course_id === state.courseId);
+        if (!items.length) {
+          root.innerHTML = courseChips() + `<div class="empty">暂无课程术语，开启下课自动提取术语后将自动同步到这里。</div>`;
+          return;
+        }
+        const idx = ((state.fcIndex % items.length) + items.length) % items.length;
+        const cur = items[idx];
+        root.innerHTML = courseChips() + `
+          <div class="meta" style="justify-content:center;">术语闪卡 ${idx+1} / ${items.length}（点击卡片翻转）</div>
+          <div class="card flashcard" onclick="state.fcFlipped=!state.fcFlipped;render()">
+            <div class="fc-term">${esc(cur.term)}</div>
+            ${state.fcFlipped
+              ? `<div class="fc-trans">${esc(cur.translation)}</div><div class="fc-note">${esc(cur.note)}</div>`
+              : `<div class="fc-note">轻点显示中文释义</div>`
+            }
+          </div>
+          <div class="row">
+            <button class="btn" onclick="state.fcIndex--;state.fcFlipped=false;render()">← 上一个</button>
+            <button class="btn primary" onclick="state.fcIndex++;state.fcFlipped=false;render()">下一个 →</button>
+          </div>
+        `;
+      } else if (state.tab === 'search') {
+        root.innerHTML = `
+          <input type="search" placeholder="搜索知识点、术语、课堂问答或字幕…" value="${esc(state.searchQuery)}" oninput="runSearch(this.value)" />
+          <div id="searchOut" style="margin-top:12px;"></div>
+        `;
+        renderSearchResults();
+      }
+    }
+
+    refreshAll();
+  </script>
+</body>
+</html>

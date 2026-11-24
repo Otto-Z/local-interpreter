@@ -1,0 +1,9 @@
+{
+  "name": "离线同传 · 知识点复习",
+  "short_name": "同传知识点",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b0f17",
+  "theme_color": "#0b0f17",
+  "description": "Mac / 平板课后同步的知识点、术语闪卡、收藏重点句与双语字幕复习"
+}

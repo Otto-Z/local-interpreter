@@ -21,6 +21,19 @@ on:
       - "scripts/**"
       - ".github/workflows/rust-and-macos.yml"
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "同时发布/更新 macOS GitHub Release（附带 .dmg 下载链接）"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rust-macos-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   rust-core-and-cloud:
@@ -48,17 +61,68 @@ jobs:
             --language kotlin --out-dir target/ci-uniffi/kotlin
 
   macos-app-build:
-    name: macOS XCFramework & SwiftUI Build (Apple Silicon)
-    if: github.event_name == 'workflow_dispatch'
+    name: macOS Apple Silicon App & DMG Release
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - name: Build XCFramework & Swift UniFFI Bindings
-        run: ./scripts/build_macos_core.sh
-      - name: Build macOS SwiftUI App
-        working-directory: macos
-        run: swift build -c release
+      - name: Read macOS app version
+        id: ver
+        run: |
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' macos/Resources/Info.plist)
+          BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' macos/Resources/Info.plist)
+          echo "name=${VERSION:-3.0.0}" >> "$GITHUB_OUTPUT"
+          echo "build=${BUILD:-1}" >> "$GITHUB_OUTPUT"
+      - name: Build XCFramework, SwiftUI App & DMG
+        run: |
+          chmod +x scripts/build_macos_core.sh scripts/package_macos_app.sh
+          ./scripts/package_macos_app.sh
+          ls -lh dist/
+      - name: Upload macOS DMG as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalInterpreterMac-v${{ steps.ver.outputs.name }}-arm64
+          path: dist/LocalInterpreterMac-v${{ steps.ver.outputs.name }}-arm64.dmg
+          retention-days: 30
+      - name: Publish or update macOS GitHub Release
+        if: |
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DMG_FILE="dist/LocalInterpreterMac-v${{ steps.ver.outputs.name }}-arm64.dmg"
+          TAG="v${{ steps.ver.outputs.name }}-macos"
+          TITLE="本地同传 macOS v${{ steps.ver.outputs.name }} (Apple Silicon)"
+          NOTES=$(cat <<'EOF'
+          ## 本地同传 macOS 原生版（Apple Silicon M1/M2/M3/M4）
+
+          ### 下载与安装
+          1. 下载下方 **`LocalInterpreterMac-v3.0.0-arm64.dmg`**，双击打开后将 **`LocalInterpreterMac.app`** 拖入 **`Applications`**。
+          2. 开源版本采用本地自签名（Ad-hoc），首次打开如 macOS 提示“无法验证开发者”，在终端执行一次即可：
+             ```bash
+             xattr -cr /Applications/LocalInterpreterMac.app
+             ```
+             然后在「应用程序」双击打开。
+          3. 首次运行可在应用内「设置 → 本地离线模型」一键下载 `Hy-MT2-1.8B`、`Qwen3-4B` 与 `Whisper Large-v3-Turbo` 并拉起本地 `llama-server` / `whisper-server`（支持 Metal GPU 加速，或接入 OpenAI 兼容接口）。
+
+          ### 版本亮点
+          - **Rust Core + 原生 SwiftUI 架构**：全端共享 SQLite WAL/FTS5、抗混叠音频重采样、VAD 分句与双语翻译管线。
+          - **实时同传与课堂助教**：支持麦克风 + ScreenCaptureKit 系统音频采集、桌面置顶悬浮字幕、5 分钟回顾、实时问答与 PDF 课件检索（RAG）。
+          - **录播音视频直接导入**：原生 `AVAssetReader` 解码 `.wav/.m4a/.mp3/.mp4/.mov`，无需安装 ffmpeg。
+          - **Google Cloud 跨端同步**：与 Android 平板和 iPhone 知识点 PWA 双向同步课次、双语字幕、知识点、自测题与术语表。
+          EOF
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$DMG_FILE" --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES"
+          else
+            gh release create "$TAG" "$DMG_FILE" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes "$NOTES"
+          fi

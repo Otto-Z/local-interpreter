@@ -1088,7 +1088,7 @@ class LlmService(private val app: App) {
                 _translatorStatus.value = "翻译超时"
                 AppLog.e("LLM", "翻译超时 after ${System.currentTimeMillis() - started}ms text=${text.take(40)}")
                 if (allowEmpty) return ""
-                throw RuntimeException("翻译超时，请检查设备内存或改用 2bit 模型/API")
+                throw RuntimeException("翻译超时，请检查设备内存或改用 1.25bit 三元量化模型/API")
             }
             if (allowEmpty && e is java.io.IOException &&
                 (e.message?.contains("Canceled", ignoreCase = true) == true ||
@@ -1109,7 +1109,7 @@ class LlmService(private val app: App) {
             AppLog.e("LLM", "翻译超时 after ${System.currentTimeMillis() - started}ms，已返回 ${partial.length}字")
             if (partial.isNotBlank()) return partial
             if (allowEmpty) return ""
-            throw RuntimeException("翻译超时，请检查设备内存或改用 2bit 模型/API")
+            throw RuntimeException("翻译超时，请检查设备内存或改用 1.25bit 三元量化模型/API")
         }
         val clean = Think.strip(raw)
         if (clean.isBlank()) {

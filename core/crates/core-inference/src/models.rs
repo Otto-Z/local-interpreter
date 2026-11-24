@@ -35,10 +35,10 @@ pub fn recommended_models() -> Vec<ModelSpec> {
     vec![
         ModelSpec {
             id: "hy-mt2-1.8b-q4".into(),
-            name: "HY-MT2 1.8B (Q4_K_M)".into(),
+            name: "Hy-MT2 1.8B (Q4_K_M)".into(),
             role: "translator".into(),
-            filename: "HY-MT2-1.8B-Q4_K_M.gguf".into(),
-            repo_path: "tencent/HY-MT1.5-1.8B-GGUF/resolve/main/HY-MT1.5-1.8B-Q4_K_M.gguf".into(),
+            filename: "Hy-MT2-1.8B-Q4_K_M.gguf".into(),
+            repo_path: "tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q4_K_M.gguf".into(),
             approx_size_mb: 1120,
             description: "主力离线同传翻译模型：低延迟、中英互译自然、显存占用低".into(),
         },

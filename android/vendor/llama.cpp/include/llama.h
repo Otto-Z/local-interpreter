@@ -157,9 +157,10 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NVFP4         = 43, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
-        LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_STQ1_0        = 41, // except 1d tensors (Tencent Hy-MT2-1.8B-1.25Bit GGUF uses file_type 41)
         LLAMA_FTYPE_MOSTLY_F8_E4M3       = 42, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0C         = 39, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q2_0          = 44, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

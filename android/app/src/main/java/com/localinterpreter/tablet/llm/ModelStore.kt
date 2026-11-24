@@ -25,7 +25,7 @@ import java.util.concurrent.TimeUnit
 enum class ModelKind(val id: String, val title: String, val detail: String, val approxBytes: Long) {
     SENSEVOICE("sensevoice", "SenseVoice 识别模型", "中/英/日/韩/粤语，自带标点，约 240MB", 239_000_000),
     TRANSLATOR("translator", "翻译模型 Hy-MT2-1.8B", "本地流式翻译，完全离线，约 1.1GB", 1_133_000_000),
-    TRANSLATOR_LITE("translator_lite", "翻译模型 轻量 2bit", "更快更省内存，质量略降，约 600MB", 600_534_880),
+    TRANSLATOR_LITE("translator_lite", "翻译模型 三元 QAT 1.25bit", "腾讯混元官方三元量化 + QAT（STQ1_0），仅 440MB，提速省内存", 461_860_800),
     ASSISTANT("assistant", "助教模型 Qwen3-4B", "总结、问答、术语提取，约 2.5GB（可选）", 2_497_000_000),
     ASSISTANT_LITE("assistant_lite", "助教模型 轻量 Qwen2.5-1.5B", "更省内存，约 1.1GB（可选）", 1_117_000_000),
 }
@@ -72,16 +72,16 @@ class ModelStore(private val context: Context) {
     fun ensureBundled() {
         copyAsset("silero_vad.onnx", sileroVad)
         copyAsset("speaker_campplus.onnx", speakerModel)
-        // 2.2.14: the old 2bit file from the Arm repo uses an incompatible
-        // on-disk layout; remove it so it cannot be mistaken for the new one.
-        val legacy = File(translatorDir, "hy-mt2-1.8b-2bit.gguf")
-        if (legacy.exists()) {
-            AppLog.d("Model", "删除旧版不兼容 2bit 模型 ${legacy.length() / 1_048_576}MB")
-            legacy.delete()
+        // 清理已废弃的旧版 2bit 模型文件及其断点残留，避免长期占用 600MB 空间。
+        for (oldName in listOf("hy-mt2-1.8b-2bit.gguf", "hy-mt2-1.8b-2bit-q2_0c.gguf")) {
+            val legacy = File(translatorDir, oldName)
+            if (legacy.exists()) {
+                AppLog.d("Model", "删除旧版 2bit 模型 $oldName (${legacy.length() / 1_048_576}MB)")
+                legacy.delete()
+            }
+            File(translatorDir, "$oldName.part").delete()
+            File(translatorDir, "$oldName.part.tmp").delete()
         }
-        // 旧文件名留下的断点文件也要清掉，否则会一直占着几百 MB。
-        File(translatorDir, "hy-mt2-1.8b-2bit.gguf.part").delete()
-        File(translatorDir, "hy-mt2-1.8b-2bit.gguf.part.tmp").delete()
     }
 
     private fun copyAsset(name: String, dest: File) {
@@ -101,7 +101,7 @@ class ModelStore(private val context: Context) {
     fun senseVoiceTokens(): File = File(senseDir, "tokens.txt")
 
     fun translatorModel(variant: String): File =
-        File(translatorDir, if (variant == "q2") "hy-mt2-1.8b-2bit-q2_0c.gguf" else "hy-mt2-1.8b-q4.gguf")
+        File(translatorDir, if (variant == "q2") "hy-mt2-1.8b-1.25bit-stq1_0.gguf" else "hy-mt2-1.8b-q4.gguf")
 
     fun assistantModel(variant: String = "4b"): File =
         File(assistantDir, if (variant == "1.5b") "qwen2.5-1.5b-instruct-q4.gguf" else "qwen3-4b-instruct-2507-q4.gguf")
@@ -155,7 +155,7 @@ class ModelStore(private val context: Context) {
     private fun minBytes(kind: ModelKind): Long = when (kind) {
         ModelKind.SENSEVOICE -> MIN_SENSEVOICE
         ModelKind.TRANSLATOR -> 1_050_000_000L
-        ModelKind.TRANSLATOR_LITE -> 600_000_000L
+        ModelKind.TRANSLATOR_LITE -> 450_000_000L
         ModelKind.ASSISTANT -> 2_300_000_000L
         ModelKind.ASSISTANT_LITE -> 1_050_000_000L
     }
@@ -224,14 +224,14 @@ class ModelStore(private val context: Context) {
                         val part = File(file.parentFile, file.name + ".part")
                         val repo = when (kind) {
                             ModelKind.TRANSLATOR -> "tencent/Hy-MT2-1.8B-GGUF"
-                            ModelKind.TRANSLATOR_LITE -> "tencent/Hy-MT2-1.8B-2Bit-GGUF"
+                            ModelKind.TRANSLATOR_LITE -> "tencent/Hy-MT2-1.8B-1.25Bit-GGUF"
                             ModelKind.ASSISTANT -> "unsloth/Qwen3-4B-Instruct-2507-GGUF"
                             ModelKind.ASSISTANT_LITE -> "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
                             ModelKind.SENSEVOICE -> ""
                         }
                         val remote = when (kind) {
                             ModelKind.TRANSLATOR -> "Hy-MT2-1.8B-Q4_K_M.gguf"
-                            ModelKind.TRANSLATOR_LITE -> "Hy-MT2-1.8B-2Bit.gguf"
+                            ModelKind.TRANSLATOR_LITE -> "Hy-MT2-1.8B-1.25Bit.gguf"
                             ModelKind.ASSISTANT -> "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
                             ModelKind.ASSISTANT_LITE -> "qwen2.5-1.5b-instruct-q4_k_m.gguf"
                             ModelKind.SENSEVOICE -> ""

@@ -480,8 +480,8 @@ fun SettingsScreen(
                                                         }
                                                     }
                                                     ChoiceCard(
-                                                        title = "2bit · 600MB",
-                                                        subtitle = "更快 · 更省内存",
+                                                        title = "三元 QAT · 440MB",
+                                                        subtitle = "官方 1.25bit · 提速省内存",
                                                         selected = settings.modelVariant == "q2",
                                                         modifier = Modifier.weight(1f),
                                                         enabled = !liveBusy && !evalBusy && !selfTestBusy,

@@ -431,10 +431,11 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_Q2_0C   = 40, // Q2_0C 2-bit per-channel quantization (proposed, PR #19357)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_Q2_0    = 42,
+        GGML_TYPE_STQ1_0  = 42, // STQ1_0 1.25-bit sparse ternary QAT (PR #22836; Tencent Hy-MT2 1.25Bit GGUF uses id 42)
         GGML_TYPE_F8_E4M3 = 43,
         GGML_TYPE_NVFP4   = 44, // NVFP4 (4 blocks, E4M3 scale); moved from 40 for Q2_0C GGUFs
-        GGML_TYPE_COUNT   = 45,
+        GGML_TYPE_Q2_0    = 45, // moved from 42 so Tencent Hy-MT2-1.8B-1.25Bit GGUFs load as STQ1_0
+        GGML_TYPE_COUNT   = 46,
     };
 
     // [TAG_GGML_PREC]

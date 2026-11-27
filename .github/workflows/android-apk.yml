@@ -102,6 +102,7 @@ jobs:
           - 使用项目统一签名密钥，支持直接覆盖升级旧版本，历史课次、模型与设置自动保留。
 
           ### 版本亮点
+          - **API 翻译全格式兼容与思考模型自愈（v2.5.2）**：适配 Gemini 2.5/3、GPT-5/o1/o3/o4、Qwen3/QwQ、GLM-4.5/Z1、Doubao、DeepSeek-R1、MiniMax-M1、Kimi-K2 等推理模型，自动下发关闭思考参数并在 400/422 时降级记忆；检测 `finish_reason=length` / 思考耗尽 `max_tokens` 时自动放大预算重试；兼容 OpenAI Chat/Responses API、Anthropic Messages、Ollama 与多模态 `content` 数组响应，失败时展示结构化诊断信息。
           - **官方三元量化 QAT 轻量翻译模型（1.25bit · 440MB）**：将原 2bit（600MB）替换为腾讯混元官方开源的 **Hy-MT2-1.8B-1.25Bit（AngelSlim 三元稀疏量化 + QAT，STQ1_0）**，并在内置 `llama.cpp` 中合入原生 **ARM64 NEON / dotprod 向量点积核（PR #22836）**，体积缩小 27%、推理更轻快。
           - **全新平板浮字幕 UI**：支持「左右双栏对照（左原文 / 右译文，每句独立一行、左右等高条条对应）」与「上下逐条卡片」一键切换；支持拖动中间分隔手柄调节双栏宽度比例、拖拽左下/右下边角与底边自由调节宽高并自动记忆位置与尺寸（双击恢复自动高度）。
           - **Google Cloud 跨端同步**：支持与 macOS 客户端和 iPhone 知识点 PWA 双向同步课程、双语字幕、知识点、术语表与重点收藏（增量水位线 + 并发锁 + 远端保护）。

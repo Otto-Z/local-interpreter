@@ -13,8 +13,8 @@ android {
         applicationId = "com.localinterpreter.tablet"
         minSdk = 29
         targetSdk = 34
-        versionCode = 20
-        versionName = "2.5.1"
+        versionCode = 21
+        versionName = "2.5.2"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }

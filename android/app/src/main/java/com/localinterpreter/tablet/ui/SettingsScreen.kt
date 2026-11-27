@@ -622,12 +622,12 @@ fun SettingsScreen(
                                                                 var first = 0L
                                                                 val text = app.llm.translate(
                                                                     "今天下午三点我们在大会议室开项目评审会，请把上周的原型带过来。",
-                                                                    "zh", "en", maxTokens = 120, temperature = 0.1f,
+                                                                    "zh", "en", maxTokens = 256, temperature = 0.1f,
                                                                 ) { if (first == 0L) first = System.currentTimeMillis() }
                                                                 val total = System.currentTimeMillis() - start
-                                                                apiMessage = "成功，首字 ${if (first > 0) first - start else total}ms，整句 ${total}ms：${text.take(40)}"
+                                                                apiMessage = "成功，首字 ${if (first > 0) first - start else total}ms，整句 ${total}ms：${text.take(60)}"
                                                             } catch (e: Exception) {
-                                                                apiMessage = "失败：${e.message?.take(100) ?: ""}"
+                                                                apiMessage = "失败：${e.message?.take(240) ?: ""}"
                                                             } finally {
                                                                 apiBusy = false
                                                             }

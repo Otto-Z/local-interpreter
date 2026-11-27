@@ -385,6 +385,32 @@ class ApiLlm(
         active.get()?.cancel()
     }
 
+    /** 标识因思考耗尽 max_tokens 或仅输出 reasoning 导致 content 为空，供上层自动放大预算重试。 */
+    class ApiReasoningBudgetException(
+        message: String,
+        val finishReason: String = "",
+        val hasReasoning: Boolean = false,
+    ) : RuntimeException(message)
+
+    private enum class ThinkingHint { NONE, CHAT_TEMPLATE, ENABLE_THINKING, REASONING_EFFORT, THINKING_DISABLED }
+
+    private fun preferredThinkingHint(forceDisable: Boolean): ThinkingHint {
+        if (noExtraParams(baseUrl, model)) return ThinkingHint.NONE
+        val m = model.lowercase()
+        return when {
+            listOf("gemini-2.5", "gemini-3", "gpt-5").any { m.contains(it) } ||
+                Regex("(^|[-_/])o[134]($|[-_.])").containsMatchIn(m) ->
+                ThinkingHint.REASONING_EFFORT
+            listOf("glm-4.5", "glm-4.6", "glm-z1", "doubao").any { m.contains(it) } ->
+                ThinkingHint.THINKING_DISABLED
+            listOf("qwen3", "qwen-3", "qwq", "thinking", "reasoner", "reasoning", "deepseek-r1", "minimax-m1", "kimi-k2")
+                .any { m.contains(it) } ->
+                ThinkingHint.CHAT_TEMPLATE
+            forceDisable -> ThinkingHint.REASONING_EFFORT
+            else -> ThinkingHint.NONE
+        }
+    }
+
     suspend fun generate(
         system: String,
         user: String,
@@ -392,23 +418,39 @@ class ApiLlm(
         temperature: Float,
         onToken: ((String) -> Unit)? = null,
         stream: Boolean = true,
+        forceDisableThinking: Boolean = false,
     ): String {
         val base = normalizeBase(baseUrl)
         if (base.isBlank()) throw RuntimeException("接口地址为空")
         val messages = JSONArray()
         if (system.isNotBlank()) messages.put(JSONObject().put("role", "system").put("content", system))
         messages.put(JSONObject().put("role", "user").put("content", user))
-        val thinkingModel = listOf("qwen3", "qwen-3", "thinking", "reasoner", "reasoning")
-            .any { model.contains(it, ignoreCase = true) }
-        fun requestBody(disableThinking: Boolean): String {
+
+        val effectiveMaxTokens = if (needsLargeBudget(baseUrl, model)) maxOf(maxTokens, 2048) else maxTokens
+        val primaryHint = preferredThinkingHint(forceDisableThinking)
+        val hintVariants = when (primaryHint) {
+            ThinkingHint.NONE -> listOf(ThinkingHint.NONE)
+            ThinkingHint.CHAT_TEMPLATE -> listOf(ThinkingHint.CHAT_TEMPLATE, ThinkingHint.ENABLE_THINKING, ThinkingHint.NONE)
+            else -> listOf(primaryHint, ThinkingHint.NONE)
+        }
+
+        fun requestBody(hint: ThinkingHint): String {
             val body = JSONObject()
                 .put("model", model.ifBlank { "default" })
                 .put("messages", messages)
                 .put("stream", stream)
                 .put("temperature", temperature)
-                .put("max_tokens", maxTokens)
-            if (disableThinking) {
-                body.put("chat_template_kwargs", JSONObject().put("enable_thinking", false))
+                .put("max_tokens", effectiveMaxTokens)
+            when (hint) {
+                ThinkingHint.CHAT_TEMPLATE ->
+                    body.put("chat_template_kwargs", JSONObject().put("enable_thinking", false))
+                ThinkingHint.ENABLE_THINKING ->
+                    body.put("enable_thinking", false)
+                ThinkingHint.REASONING_EFFORT ->
+                    body.put("reasoning_effort", "none")
+                ThinkingHint.THINKING_DISABLED ->
+                    body.put("thinking", JSONObject().put("type", "disabled"))
+                ThinkingHint.NONE -> Unit
             }
             return body.toString()
         }
@@ -417,23 +459,21 @@ class ApiLlm(
         var lastError: Throwable? = null
         for (url in urls) {
             var nextUrl = false
-            val variants = if (thinkingModel) listOf(true, false) else listOf(false)
-            for (disableThinking in variants) {
+            for (hint in hintVariants) {
                 val request = Request.Builder()
                     .url(url)
                     .header(
                         "Accept",
                         if (stream) "text/event-stream, application/json" else "application/json",
                     )
-                    .post(requestBody(disableThinking).toRequestBody("application/json".toMediaType()))
+                    .post(requestBody(hint).toRequestBody("application/json".toMediaType()))
                     .apply { if (apiKey.isNotBlank()) header("Authorization", "Bearer $apiKey") }
                     .build()
                 val call = (if (stream) sharedStreamClient else sharedBlockingClient).newCall(request)
                 AppLog.d(
                     "LLM-API",
                     "POST url=$url model=${model.ifBlank { "default" }} stream=$stream " +
-                        "thinkingModel=$thinkingModel disableThinking=$disableThinking text=${user.length}字 " +
-                        "maxTokens=$maxTokens",
+                        "hint=$hint text=${user.length}字 maxTokens=$effectiveMaxTokens",
                 )
                 active.set(call)
                 val job = kotlin.coroutines.coroutineContext[Job]
@@ -460,9 +500,14 @@ class ApiLlm(
                     return text
                 } catch (e: ApiHttpException) {
                     lastError = e
-                    AppLog.e("LLM-API", "请求失败 url=$url disableThinking=$disableThinking ${e.message?.take(200)}")
-                    // 服务端不接受 chat_template_kwargs（常见 400 或 FastAPI 422）时，去掉该参数重试一次。
-                    if ((e.code == 400 || e.code == 422) && disableThinking) continue
+                    AppLog.e("LLM-API", "请求失败 url=$url hint=$hint ${e.message?.take(200)}")
+                    // 服务端不接受扩展参数（常见 400 或 FastAPI 422）时，尝试下一档或退回无扩展参数并记住。
+                    if ((e.code == 400 || e.code == 422) && hint != ThinkingHint.NONE) {
+                        if (hint == hintVariants.dropLast(1).lastOrNull()) {
+                            markNoExtraParams(baseUrl, model)
+                        }
+                        continue
+                    }
                     if (e.code == 404 && url != urls.last()) {
                         nextUrl = true
                         break
@@ -517,22 +562,35 @@ class ApiLlm(
                 .ifBlank { parseSseText(whole) }
                 .ifBlank { parseJsonLines(whole) }
             if (text.isBlank()) {
-                val reasoning = whole.contains("reasoning_content")
-                val err = runCatching {
-                    val obj = JSONObject(whole.trim())
-                    obj.optJSONObject("error")?.optString("message")?.takeIf { it.isNotBlank() }
-                        ?: obj.optString("message").takeIf {
-                            it.isNotBlank() && obj.optJSONArray("choices") == null
+                val diag = diagnoseEmptyJson(whole)
+                AppLog.e("LLM-API", "接口返回空内容：diag=$diag body=${whole.take(600)}")
+                when {
+                    !diag.error.isNullOrBlank() ->
+                        throw RuntimeException("接口返回错误：${diag.error.take(200)}")
+                    !diag.refusal.isNullOrBlank() ->
+                        throw RuntimeException("接口拒绝回复：${diag.refusal.take(160)}")
+                    diag.finishReason == "content_filter" ->
+                        throw RuntimeException("接口内容被安全策略过滤（content_filter）")
+                    diag.finishReason == "length" || diag.hasReasoning -> {
+                        val reasonDetail = buildString {
+                            if (diag.reasoningTokens > 0) append("思考消耗 ${diag.reasoningTokens} tokens")
+                            else if (diag.hasReasoning) append("仅返回了思考字段")
+                            if (diag.finishReason.isNotBlank()) {
+                                if (isNotEmpty()) append("，")
+                                append("finish_reason=${diag.finishReason}")
+                            }
                         }
-                }.getOrNull()
-                AppLog.e("LLM-API", "接口返回空内容：${whole.take(500)}")
-                throw RuntimeException(
-                    when {
-                        !err.isNullOrBlank() -> "接口返回错误：${err.take(200)}"
-                        reasoning -> "接口只返回了思考内容（reasoning_content），没有最终译文。请在服务端关闭 thinking，或改用普通对话模型。"
-                        else -> "接口返回为空（HTTP ${resp.code}，Content-Type: $contentType）。响应开头：${whole.take(160)}"
+                        throw ApiReasoningBudgetException(
+                            "模型输出为空（$reasonDetail），未生成最终译文。请在服务端关闭思考模式或改用非思考对话模型。",
+                            finishReason = diag.finishReason,
+                            hasReasoning = diag.hasReasoning,
+                        )
                     }
-                )
+                    else -> {
+                        val summary = diag.summary.ifBlank { whole.take(160) }
+                        throw RuntimeException("接口返回为空（HTTP ${resp.code}，$summary）")
+                    }
+                }
             }
             onToken?.invoke(text)
             return text
@@ -549,13 +607,20 @@ class ApiLlm(
                 obj.optJSONObject("error")?.optString("message")
                     ?.takeIf { it.isNotBlank() }
                     ?.let { serverError = it.take(200) }
+                // 兼容 OpenAI Responses API 流式事件：{"type":"response.output_text.delta","delta":"..."}
+                if (obj.optString("type") == "response.output_text.delta") {
+                    val piece = contentOf(obj, "delta")
+                    if (piece.isNotEmpty()) {
+                        sb.append(piece)
+                        onToken?.invoke(piece)
+                    }
+                    continue
+                }
                 val choice = obj.optJSONArray("choices")?.optJSONObject(0) ?: continue
-                choice.optString("finish_reason").takeIf { it.isNotBlank() }?.let { finishReason = it }
+                choice.optString("finish_reason").takeIf { it.isNotBlank() && it != "null" }?.let { finishReason = it }
                 val delta = choice.optJSONObject("delta")
                 val message = choice.optJSONObject("message")
-                if (contentOf(delta, "reasoning_content").isNotEmpty() ||
-                    contentOf(message, "reasoning_content").isNotEmpty()
-                ) {
+                if (hasReasoningField(delta) || hasReasoningField(message)) {
                     sawReasoning = true
                 }
                 val piece = contentOf(delta, "content")
@@ -569,22 +634,28 @@ class ApiLlm(
             }
         }
         if (sb.isEmpty()) {
-            val fallback = parseCompletion(raw.toString()).ifBlank { parseSseText(raw.toString()) }
+            val rawStr = raw.toString()
+            val fallback = parseCompletion(rawStr)
+                .ifBlank { parseSseText(rawStr) }
+                .ifBlank { parseJsonLines(rawStr) }
             if (fallback.isNotBlank()) {
                 onToken?.invoke(fallback)
                 return fallback
             }
-            AppLog.e("LLM-API", "接口流式返回空内容：${raw.take(500)}")
-            val message = when {
-                serverError != null -> "接口返回错误：$serverError"
-                finishReason == "content_filter" -> "接口内容被安全策略过滤（content_filter）"
-                sawReasoning || raw.contains("reasoning_content") ->
-                    "接口只返回了思考内容（reasoning_content），没有最终译文。请在服务端关闭 thinking，或改用普通对话模型。"
-                finishReason == "length" ->
-                    "接口输出为空且被长度上限截断（finish_reason=length），可能 max_tokens 不足或模型把额度用在思考上。"
-                else -> "接口没有返回任何内容（SSE）。请确认模型名正确、服务端支持 /chat/completions 且未拒绝 stream。"
+            AppLog.e("LLM-API", "接口流式返回空内容：${rawStr.take(600)}")
+            val hasReasoningText = sawReasoning || rawStr.contains("reasoning_content") ||
+                rawStr.contains("\"reasoning\"") || rawStr.contains("\"thinking\"")
+            when {
+                serverError != null -> throw RuntimeException("接口返回错误：$serverError")
+                finishReason == "content_filter" -> throw RuntimeException("接口内容被安全策略过滤（content_filter）")
+                finishReason == "length" || hasReasoningText ->
+                    throw ApiReasoningBudgetException(
+                        "模型流式输出为空（${if (finishReason.isNotBlank()) "finish_reason=$finishReason" else "仅输出思考内容"}），没有最终译文。",
+                        finishReason = finishReason,
+                        hasReasoning = hasReasoningText,
+                    )
+                else -> throw RuntimeException("接口没有返回任何内容（SSE）。请确认模型名正确、服务端支持 /chat/completions 且未拒绝 stream。")
             }
-            throw RuntimeException(message)
         }
         return sb.toString()
     }
@@ -592,21 +663,37 @@ class ApiLlm(
     companion object {
         // 某些网关的 SSE 永远是空的；记住 10 分钟，后续请求直接走非流式，省掉每句一次空等待。
         private val blockingPreferred = java.util.concurrent.ConcurrentHashMap<String, Long>()
+        // 某些推理模型需要更大 max_tokens 才能在思考后输出译文；记住 10 分钟。
+        private val largeBudgetPreferred = java.util.concurrent.ConcurrentHashMap<String, Long>()
+        // 某些服务端严格校验字段，拒绝 chat_template_kwargs / reasoning_effort / thinking；记住 10 分钟。
+        private val noExtraParamsPreferred = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
         private fun apiKey(base: String, model: String): String =
             normalizeBase(base).lowercase() + "|" + model.lowercase()
 
-        fun preferBlocking(base: String, model: String): Boolean {
-            val at = blockingPreferred[apiKey(base, model)] ?: return false
+        private fun checkTtl(map: java.util.concurrent.ConcurrentHashMap<String, Long>, base: String, model: String): Boolean {
+            val key = apiKey(base, model)
+            val at = map[key] ?: return false
             if (System.currentTimeMillis() - at > 10 * 60_000L) {
-                blockingPreferred.remove(apiKey(base, model))
+                map.remove(key)
                 return false
             }
             return true
         }
 
+        fun preferBlocking(base: String, model: String): Boolean = checkTtl(blockingPreferred, base, model)
         fun markStreamBroken(base: String, model: String) {
             blockingPreferred[apiKey(base, model)] = System.currentTimeMillis()
+        }
+
+        fun needsLargeBudget(base: String, model: String): Boolean = checkTtl(largeBudgetPreferred, base, model)
+        fun markNeedsLargeBudget(base: String, model: String) {
+            largeBudgetPreferred[apiKey(base, model)] = System.currentTimeMillis()
+        }
+
+        fun noExtraParams(base: String, model: String): Boolean = checkTtl(noExtraParamsPreferred, base, model)
+        fun markNoExtraParams(base: String, model: String) {
+            noExtraParamsPreferred[apiKey(base, model)] = System.currentTimeMillis()
         }
 
         // 所有 API 调用共用一个连接池，避免每句字幕都重新 TLS 握手并堆积空闲 socket。
@@ -648,7 +735,15 @@ class ApiLlm(
             return base
         }
 
-        /** org.json 的 optString 会把 JSON null 变成字符串 "null"，这里统一判空；兼容数组式 content。 */
+        private fun hasReasoningField(obj: JSONObject?): Boolean {
+            if (obj == null) return false
+            return contentOf(obj, "reasoning_content").isNotEmpty() ||
+                contentOf(obj, "reasoning").isNotEmpty() ||
+                contentOf(obj, "thinking").isNotEmpty() ||
+                contentOf(obj, "thoughts").isNotEmpty()
+        }
+
+        /** org.json 的 optString 会把 JSON null 变成字符串 "null"，这里统一判空；兼容数组式 content 与多模态 parts。 */
         private fun contentOf(obj: JSONObject?, key: String): String {
             if (obj == null || !obj.has(key) || obj.isNull(key)) return ""
             return when (val value = obj.opt(key)) {
@@ -657,17 +752,148 @@ class ApiLlm(
                     for (i in 0 until value.length()) {
                         when (val part = value.opt(i)) {
                             null, JSONObject.NULL -> Unit
-                            is JSONObject -> append(
-                                contentOf(part, "text").ifEmpty { contentOf(part, "content") }
-                            )
+                            is JSONObject -> {
+                                val type = part.optString("type").lowercase()
+                                if (type == "thinking" || type == "reasoning" || type == "thought" || part.optBoolean("thought", false)) {
+                                    continue
+                                }
+                                append(
+                                    contentOf(part, "text")
+                                        .ifEmpty { contentOf(part, "output_text") }
+                                        .ifEmpty { contentOf(part, "content") }
+                                )
+                            }
                             is String -> append(part)
                             else -> append(part.toString())
                         }
                     }
                 }
+                is JSONObject -> contentOf(value, "text").ifEmpty { contentOf(value, "content") }
                 null, JSONObject.NULL -> ""
                 else -> value.toString()
             }
+        }
+
+        private fun extractFromJsonObject(obj: JSONObject, depth: Int = 0): String {
+            if (depth > 3) return ""
+            // 1. 标准 OpenAI Chat Completions / 兼容网关（支持 message / delta / text / parts / 多 choice）
+            obj.optJSONArray("choices")?.let { choices ->
+                for (i in 0 until choices.length()) {
+                    val choice = choices.optJSONObject(i) ?: continue
+                    val msg = choice.optJSONObject("message")
+                    val delta = choice.optJSONObject("delta")
+                    val extracted = contentOf(msg, "content")
+                        .ifBlank { contentOf(msg, "output_text") }
+                        .ifBlank { contentOf(msg, "parts") }
+                        .ifBlank { contentOf(delta, "content") }
+                        .ifBlank { contentOf(choice, "text") }
+                        .ifBlank { contentOf(choice, "content") }
+                    if (extracted.isNotBlank()) return extracted
+                }
+            }
+            // 2. OpenAI Responses API: {"id":"resp_...", "output_text":"..."} 或 output[].content[].text
+            contentOf(obj, "output_text").takeIf { it.isNotBlank() }?.let { return it }
+            obj.optJSONArray("output")?.let { outputArr ->
+                val out = buildString {
+                    for (i in 0 until outputArr.length()) {
+                        val item = outputArr.optJSONObject(i) ?: continue
+                        val type = item.optString("type").lowercase()
+                        if (type == "reasoning" || type == "thinking") continue
+                        append(
+                            contentOf(item, "content")
+                                .ifEmpty { contentOf(item, "text") }
+                                .ifEmpty { contentOf(item, "output_text") }
+                        )
+                    }
+                }
+                if (out.isNotBlank()) return out
+            }
+            // 3. Anthropic Messages API: {"id":"msg_...", "content":[{"type":"text","text":"..."}]}
+            contentOf(obj, "content").takeIf { it.isNotBlank() }?.let { return it }
+            // 4. Ollama /api/chat: {"message":{"role":"assistant","content":"..."}}
+            contentOf(obj.optJSONObject("message"), "content").takeIf { it.isNotBlank() }?.let { return it }
+            // 5. 嵌套包装：{"code":0,"data":{"choices":[...]}}
+            obj.optJSONObject("data")?.let { dataObj ->
+                val nested = extractFromJsonObject(dataObj, depth + 1)
+                if (nested.isNotBlank()) return nested
+            }
+            // 6. 极简自定义网关：{"id":"...","response":"..."} / {"result":"..."} / {"text":"..."}
+            if (!obj.has("choices")) {
+                contentOf(obj, "response").takeIf { it.isNotBlank() }?.let { return it }
+                contentOf(obj, "result").takeIf { it.isNotBlank() }?.let { return it }
+                contentOf(obj, "text").takeIf { it.isNotBlank() }?.let { return it }
+            }
+            return ""
+        }
+
+        private data class EmptyDiag(
+            val error: String? = null,
+            val refusal: String? = null,
+            val finishReason: String = "",
+            val hasReasoning: Boolean = false,
+            val reasoningTokens: Int = 0,
+            val summary: String = "",
+        )
+
+        private fun diagnoseEmptyJson(whole: String): EmptyDiag {
+            val trimmed = whole.trim()
+            if (!trimmed.startsWith("{")) return EmptyDiag(summary = "非 JSON 响应：${trimmed.take(120)}")
+            return runCatching {
+                val obj = JSONObject(trimmed)
+                val errObj = obj.optJSONObject("error")
+                val err = errObj?.optString("message")?.takeIf { it.isNotBlank() && it != "null" }
+                    ?: obj.optString("error").takeIf { it.isNotBlank() && it != "null" && !it.startsWith("{") }
+                    ?: obj.optString("message").takeIf { it.isNotBlank() && it != "null" && obj.optJSONArray("choices") == null }
+                    ?: obj.optString("msg").takeIf { it.isNotBlank() && it != "null" && obj.optJSONArray("choices") == null }
+                val choices = obj.optJSONArray("choices")
+                val firstChoice = choices?.optJSONObject(0)
+                val msg = firstChoice?.optJSONObject("message") ?: firstChoice?.optJSONObject("delta")
+                val finishReason = firstChoice?.optString("finish_reason")
+                    ?.takeIf { it.isNotBlank() && it != "null" }
+                    ?: obj.optString("status").takeIf { it == "incomplete" }
+                    ?: ""
+                val refusal = contentOf(msg, "refusal").takeIf { it.isNotBlank() }
+                val usage = obj.optJSONObject("usage")
+                val details = usage?.optJSONObject("completion_tokens_details")
+                    ?: usage?.optJSONObject("output_tokens_details")
+                val reasoningTokens = details?.optInt("reasoning_tokens", 0) ?: 0
+                val hasReasoning = reasoningTokens > 0 ||
+                    hasReasoningField(msg) ||
+                    hasReasoningField(firstChoice) ||
+                    whole.contains("\"reasoning_content\"") ||
+                    whole.contains("\"reasoning\":") ||
+                    whole.contains("\"thinking\":")
+                val summary = buildString {
+                    if (finishReason.isNotBlank()) append("finish_reason=$finishReason")
+                    if (choices != null) {
+                        if (isNotEmpty()) append("，")
+                        append("choices=${choices.length()}")
+                    }
+                    if (msg != null) {
+                        val keys = mutableListOf<String>()
+                        val it = msg.keys()
+                        while (it.hasNext() && keys.size < 6) keys.add(it.next())
+                        if (keys.isNotEmpty()) {
+                            if (isNotEmpty()) append("，")
+                            append("message=${keys.joinToString(",")}")
+                        }
+                    }
+                    if (isEmpty()) {
+                        val topKeys = mutableListOf<String>()
+                        val it = obj.keys()
+                        while (it.hasNext() && topKeys.size < 6) topKeys.add(it.next())
+                        append("字段=${topKeys.joinToString(",")}")
+                    }
+                }
+                EmptyDiag(
+                    error = err,
+                    refusal = refusal,
+                    finishReason = finishReason,
+                    hasReasoning = hasReasoning,
+                    reasoningTokens = reasoningTokens,
+                    summary = summary,
+                )
+            }.getOrElse { EmptyDiag(summary = "响应：${trimmed.take(120)}") }
         }
 
         private fun parseJsonLines(text: String): String {
@@ -676,13 +902,8 @@ class ApiLlm(
                 val t = line.trim()
                 if (!t.startsWith("{")) return@forEach
                 runCatching {
-                    val obj = JSONObject(t)
-                    val choice = obj.optJSONArray("choices")?.optJSONObject(0) ?: return@runCatching
-                    sb.append(
-                        contentOf(choice.optJSONObject("delta"), "content")
-                            .ifEmpty { contentOf(choice.optJSONObject("message"), "content") }
-                            .ifEmpty { contentOf(choice, "text") }
-                    )
+                    val piece = extractFromJsonObject(JSONObject(t))
+                    if (piece.isNotEmpty()) sb.append(piece)
                 }
             }
             return sb.toString()
@@ -690,17 +911,13 @@ class ApiLlm(
 
         private fun parseCompletion(text: String): String {
             return try {
-                val obj = JSONObject(text.trim())
-                val choice = obj.optJSONArray("choices")?.optJSONObject(0) ?: return ""
-                contentOf(choice.optJSONObject("message"), "content")
-                    .takeIf { it.isNotBlank() }
-                    ?: contentOf(choice, "text")
+                extractFromJsonObject(JSONObject(text.trim()))
             } catch (_: Exception) {
                 ""
             }
         }
 
-        /** 从一段完整的 SSE 文本里拼出内容；兼容 delta 与 message 两种字段。 */
+        /** 从一段完整的 SSE 文本里拼出内容；兼容 delta、message 与 Responses API 事件。 */
         private fun parseSseText(text: String): String {
             val sb = StringBuilder()
             text.lineSequence().forEach { line ->
@@ -710,11 +927,12 @@ class ApiLlm(
                 if (data.isEmpty() || data == "[DONE]") return@forEach
                 runCatching {
                     val obj = JSONObject(data)
-                    val choice = obj.optJSONArray("choices")?.optJSONObject(0) ?: return@runCatching
-                    val piece = contentOf(choice.optJSONObject("delta"), "content")
-                        .ifEmpty { contentOf(choice.optJSONObject("message"), "content") }
-                        .ifEmpty { contentOf(choice, "text") }
-                    sb.append(piece)
+                    val piece = if (obj.optString("type") == "response.output_text.delta") {
+                        contentOf(obj, "delta")
+                    } else {
+                        extractFromJsonObject(obj)
+                    }
+                    if (piece.isNotEmpty()) sb.append(piece)
                 }
             }
             return sb.toString().ifBlank { parseCompletion(text) }
@@ -825,14 +1043,29 @@ class LlmService(private val app: App) {
                 onToken?.invoke(piece)
             }
         }
+        var curMaxTokens = maxTokens
+        var forceDisableThinking = false
         for (attempt in 1..3) {
             val useStream = attempt == 1 && !ApiLlm.preferBlocking(base, model)
             val api = ApiLlm(base, model, key)
             apiAssistantCalls.add(api)
             try {
-                return api.generate(system, prompt, maxTokens, temperature, sink, stream = useStream)
+                return api.generate(
+                    system, prompt, curMaxTokens, temperature, sink,
+                    stream = useStream,
+                    forceDisableThinking = forceDisableThinking,
+                )
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: ApiLlm.ApiReasoningBudgetException) {
+                last = e
+                if (collected.isNotEmpty()) return collected.toString()
+                ApiLlm.markNeedsLargeBudget(base, model)
+                curMaxTokens = if (curMaxTokens >= 2048) 4096 else maxOf(curMaxTokens * 6, 2048)
+                forceDisableThinking = true
+                if (attempt == 3) throw e
+                AppLog.d("LLM", "API 助教思考耗尽预算，自动放大 max_tokens=$curMaxTokens 重试 $attempt/3")
+                kotlinx.coroutines.delay(200L * attempt)
             } catch (e: Throwable) {
                 last = e
                 if (collected.isNotEmpty()) return collected.toString()
@@ -860,7 +1093,7 @@ class LlmService(private val app: App) {
         throw last ?: RuntimeException("助教 API 失败")
     }
 
-    /** 兼容网关偶发返回空 SSE：自动重试，避免十次只有一次成功。 */
+    /** 兼容网关偶发返回空 SSE 及思考模型耗尽 max_tokens：自动切换非流式与放大预算重试。 */
     private suspend fun apiTranslateWithRetry(
         s: SettingsData,
         system: String,
@@ -877,15 +1110,31 @@ class LlmService(private val app: App) {
                 onToken?.invoke(piece)
             }
         }
+        var curMaxTokens = maxTokens
+        var forceDisableThinking = false
         for (attempt in 1..3) {
             // 第一次用流式；网关 SSE 偶发返回空时，后续改用非流式整包返回。
             val useStream = attempt == 1 && !ApiLlm.preferBlocking(s.apiBaseUrl, s.apiModel)
             val api = ApiLlm(s.apiBaseUrl, s.apiModel, s.apiKey)
             apiTranslatorCalls.add(api)
             try {
-                return api.generate(system, text, maxTokens, temperature, sink, stream = useStream)
+                return api.generate(
+                    system, text, curMaxTokens, temperature, sink,
+                    stream = useStream,
+                    forceDisableThinking = forceDisableThinking,
+                )
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: ApiLlm.ApiReasoningBudgetException) {
+                last = e
+                if (collected.isNotEmpty()) return collected.toString()
+                ApiLlm.markNeedsLargeBudget(s.apiBaseUrl, s.apiModel)
+                curMaxTokens = if (curMaxTokens >= 2048) 4096 else maxOf(curMaxTokens * 8, 2048)
+                forceDisableThinking = true
+                if (attempt == 3) throw e
+                _translatorStatus.value = "模型思考截断，放大额度重试 $attempt/3"
+                AppLog.d("LLM", "API 翻译思考耗尽预算，自动关闭思考并放大 max_tokens=$curMaxTokens 重试 $attempt/3")
+                kotlinx.coroutines.delay(200L * attempt)
             } catch (e: Throwable) {
                 last = e
                 if (collected.isNotEmpty()) {
